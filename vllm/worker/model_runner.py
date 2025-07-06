@@ -23,6 +23,12 @@ from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.attention.backends.abstract import AttentionState
 from vllm.attention.backends.utils import CommonAttentionState
 from vllm.config import CompilationLevel, VllmConfig
+# 新增
+from vllm.steer_vectors.layers import SteerVectorMapping
+from vllm.steer_vectors.request import SteerVectorRequest
+from vllm.steer_vectors.worker_manager import (
+    LRUCacheWorkerSteerVectorManager)
+
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.distributed import broadcast_tensor_dict, get_pp_group
 from vllm.distributed.kv_transfer import get_kv_transfer_group
@@ -97,6 +103,10 @@ class ModelInputForGPU(ModelRunnerInputBase):
     attn_metadata: Optional["AttentionMetadata"] = None
     prompt_adapter_mapping: Optional[PromptAdapterMapping] = None
     prompt_adapter_requests: Optional[Set[PromptAdapterRequest]] = None
+    # 新增
+    steer_vector_mapping: Optional[SteerVectorMapping] = None
+    steer_vector_requests: Optional[Set[SteerVectorRequest]] = None
+
     multi_modal_kwargs: Optional[BatchedTensorInputs] = None
     request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
     finished_requests_ids: Optional[List[str]] = None
@@ -115,6 +125,10 @@ class ModelInputForGPU(ModelRunnerInputBase):
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "prompt_adapter_mapping": self.prompt_adapter_mapping,
             "prompt_adapter_requests": self.prompt_adapter_requests,
+            # 新增
+            "steer_vector_mapping": self.steer_vector_mapping,
+            "steer_vector_requests": self.steer_vector_requests,
+
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
@@ -257,6 +271,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             prompt_adapter_prompt_mapping: Optional[List[int]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
 
+            # 新增
+            steer_vector_mapping: Optional[List[int]] = None,
+            steer_vector_request: Optional[SteerVectorRequest] = None,
+
             # Multi-modal inputs.
             multi_modal_kwargs: Optional[MultiModalKwargs] = None,
             multi_modal_placeholder_maps: Optional[Dict[
@@ -396,6 +414,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                     prompt_adapter_prompt_mapping or [])
 
             self.prompt_adapter_request = prompt_adapter_request
+            self.steer_vector_request = steer_vector_request # 新增
+
             self.multi_modal_kwargs = multi_modal_kwargs
             self.multi_modal_placeholder_maps = multi_modal_placeholder_maps
             self.prefix_cache_hit = prefix_cache_hit
@@ -487,6 +507,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.per_seq_group_compute_fns = [
             self._compute_prompt_adapter_input,
             self._compute_multi_modal_input,
+            self._compute_steer_vector_input # 新增
         ]
 
         self.runner = runner
@@ -498,6 +519,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.enable_lora = self.runner.lora_config is not None
         self.enable_prompt_adapter = (self.runner.prompt_adapter_config
                                       is not None)
+        # 新增
+        self.enable_steer_vector = (self.runner.steer_vector_config
+                                    is not None)
 
         # Attention metadata inputs.
         if self.attn_backend is not None:
@@ -720,6 +744,20 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         inter_data.prompt_adapter_prompt_mapping = [prompt_adapter_id] * (
             query_len if seq_group_metadata.sampling_params
             and seq_group_metadata.sampling_params.prompt_logprobs else 1)
+
+    # 新增
+    def _compute_steer_vector_input(
+            self,
+            inter_data: InterDataForSeqGroup,
+            seq_group_metadata: SequenceGroupMetadata,
+    ):
+        """If steer vector is enabled, compute index and prompt mapping.
+        """
+        if not self.enable_steer_vector:
+            return
+
+        inter_data.steer_vector_request = (
+            seq_group_metadata.steer_vector_request)
 
     def _compute_multi_modal_input(self, inter_data: InterDataForSeqGroup,
                                    seq_group_metadata: SequenceGroupMetadata):
@@ -1032,6 +1070,14 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 prompt_adapter_prompt_mapping,
             )
 
+        # 新增
+        # Steer vector data.
+        steer_vector_requests: Set[SteerVectorRequest] = set()
+        if self.enable_steer_vector:
+            steer_vector_requests = set(data.steer_vector_request
+                                        for data in self.inter_data_list
+                                        if data.steer_vector_request)
+
         # Multi-modal data.
         multi_modal_kwargs_list = [
             data.multi_modal_kwargs for data in self.inter_data_list
@@ -1053,7 +1099,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             request_ids_to_seq_ids=request_ids_to_seq_ids,
             finished_requests_ids=self.finished_requests_ids,
             prompt_adapter_mapping=prompt_adapter_mapping,
-            prompt_adapter_requests=prompt_adapter_requests)
+            prompt_adapter_requests=prompt_adapter_requests,
+            steer_vector_requests=steer_vector_requests # 新增
+        )
 
 
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
@@ -1145,6 +1193,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         # Set after load_model.
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
         self.prompt_adapter_manager: LRUCacheWorkerPromptAdapterManager = None
+        self.steer_vector_manager: LRUCacheWorkerSteerVectorManager = None # 新增
         self.sampler = get_sampler()
 
         set_cpu_offload_max_bytes(
@@ -1210,6 +1259,14 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 self.prompt_adapter_config)
             self.model = (
                 self.prompt_adapter_manager.create_prompt_adapter_manager(
+                    self.model))
+
+        # 新增
+        if self.steer_vector_config:
+            self.steer_vector_manager = LRUCacheWorkerSteerVectorManager(
+                self.device, self.steer_vector_config)
+            self.model = (
+                self.steer_vector_manager.create_steer_vector_manager(
                     self.model))
 
         if self.vllm_config.compilation_config.level ==\
@@ -1495,6 +1552,25 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             raise RuntimeError("PromptAdapter is not enabled.")
         return self.prompt_adapter_manager.list_adapters()
 
+    # 新增
+    def set_active_steer_vectors(
+            self, steer_vector_requests: Set[SteerVectorRequest]):
+        if not self.steer_vector_manager:
+            raise RuntimeError("Steer Vector is not enabled.")
+        self.steer_vector_manager.set_active_adapters(
+            steer_vector_requests)
+
+    def add_steer_vector(
+            self, steer_vector_request: SteerVectorRequest) -> bool:
+        if not self.steer_vector_manager:
+            raise RuntimeError("Steer Vector is not enabled.")
+        return self.steer_vector_manager.add_adapter(steer_vector_request)
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        if not self.steer_vector_manager:
+            raise RuntimeError("Steer Vector is not enabled.")
+        return self.steer_vector_manager.remove_adapter(steer_vector_id)
+
     @torch.inference_mode()
     def capture_model(self, kv_caches: List[List[torch.Tensor]]) -> None:
         """Cuda graph capture a model.
@@ -1610,6 +1686,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         )
                         self.set_active_prompt_adapters(
                             set(), prompt_adapter_mapping)
+
+                    # 新增
+                    if self.steer_vector_config:
+                        self.set_active_steer_vectors(set())
+
                     graph_runner = CUDAGraphRunner(
                         self.model, self.attn_backend.get_name(),
                         self.attn_state.graph_clone(batch_size),
@@ -1777,6 +1858,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 model_input.prompt_adapter_requests,
                 model_input.prompt_adapter_mapping)
 
+        # 新增
+        if self.steer_vector_config:
+            assert model_input.steer_vector_requests is not None
+            self.set_active_steer_vectors(
+                model_input.steer_vector_requests, )
+
         self.attn_state.begin_forward(model_input)
 
         # Currently cuda graph is only supported by the decode phase.
@@ -1839,8 +1926,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            # 新增
+            # Determine if we're in decode phase
+            is_decode_phase = (model_input.attn_metadata is not None and
+                               model_input.attn_metadata.decode_metadata is not None and
+                               model_input.attn_metadata.prefill_metadata is None)
             with set_forward_context(model_input.attn_metadata,
-                                     self.vllm_config, virtual_engine):
+                                     self.vllm_config, virtual_engine,
+                                     current_tokens=model_input.input_tokens, # 新增
+                                     is_decode=is_decode_phase # 新增
+                                     ):
                 hidden_or_intermediate_states = model_executable(
                     input_ids=model_input.input_tokens,
                     inputs_embeds=model_input.inputs_embeds,

@@ -1649,6 +1649,8 @@ class Scheduler:
                         seq_group.multi_modal_placeholders
                         if scheduler_outputs.num_prefill_groups > 0 else None),
                     prompt_adapter_request=seq_group.prompt_adapter_request,
+                    # 新增
+                    steer_vector_request=seq_group.steer_vector_request,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for

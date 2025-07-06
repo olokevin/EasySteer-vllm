@@ -13,6 +13,7 @@ from weakref import ReferenceType
 import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VllmConfig)
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_timeout import asyncio_timeout
@@ -436,6 +437,8 @@ class _AsyncLLMEngine(LLMEngine):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        # 新增
+        steer_vector_request: Optional[SteerVectorRequest] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> None:
@@ -446,6 +449,11 @@ class _AsyncLLMEngine(LLMEngine):
         if lora_request is not None and not self.lora_config:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "
                              "not enabled!")
+        # 新增
+        if (steer_vector_request is not None
+                and not self.steer_vector_config):
+            raise ValueError(f"Got cv_request {lora_request} but "
+                             "steer vector is not enabled!")
         if priority != 0 and not self.scheduler_config.policy == "priority":
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
@@ -490,6 +498,7 @@ class _AsyncLLMEngine(LLMEngine):
             arrival_time=arrival_time,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request, # 新增
             trace_headers=trace_headers,
             priority=priority,
         )
@@ -860,6 +869,7 @@ class AsyncLLMEngine(EngineClient):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> AsyncGenerator[Union[RequestOutput, PoolingRequestOutput], None]:
@@ -887,6 +897,7 @@ class AsyncLLMEngine(EngineClient):
             lora_request=lora_request,
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request, # 新增
             priority=priority,
             data_parallel_rank=data_parallel_rank,
         )
@@ -901,6 +912,7 @@ class AsyncLLMEngine(EngineClient):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> AsyncGenerator[RequestOutput, None]:
@@ -980,6 +992,7 @@ class AsyncLLMEngine(EngineClient):
                     lora_request=lora_request,
                     trace_headers=trace_headers,
                     prompt_adapter_request=prompt_adapter_request,
+                    steer_vector_request=steer_vector_request, # 新增
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
             ):
@@ -1180,7 +1193,10 @@ class AsyncLLMEngine(EngineClient):
 
     async def add_lora(self, lora_request: LoRARequest) -> None:
         self.engine.add_lora(lora_request)
-
+    # 新增
+    async def add_steer_vector(self,
+                               cv_request: SteerVectorRequest) -> None:
+        self.engine.add_steer_vector(cv_request)
     async def collective_rpc(self,
                              method: str,
                              timeout: Optional[float] = None,

@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional, Union
 import msgspec
 import torch
 
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.inputs import SingletonInputs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MultiModalKwargs, MultiModalPlaceholderDict
@@ -734,6 +735,7 @@ class SequenceGroup:
                  encoder_seq: Optional[Sequence] = None,
                  trace_headers: Optional[Mapping[str, str]] = None,
                  prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+                 steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
                  priority: int = 0,
                  draft_size: int = 1) -> None:
         self.request_id = request_id
@@ -758,6 +760,7 @@ class SequenceGroup:
         self.pooling_params = pooling_params
         self.pooled_data = pooled_data
         self.prompt_adapter_request = prompt_adapter_request
+        self.steer_vector_request = steer_vector_request # 新增
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
@@ -1022,6 +1025,7 @@ class SequenceGroupMetadata(
                            unless you are working with an encoder/decoder
                            model.
         prompt_adapter_request: Prompt Adapter request.
+        steer_vector_request: Steer Vector request.  # 新增
     """
 
     request_id: str
@@ -1041,6 +1045,7 @@ class SequenceGroupMetadata(
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[list[int]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
+    steer_vector_request: Optional[SteerVectorRequest] = None  # 新增
     token_chunk_size: Optional[int] = None
 
     ### Stateful fields that are lazily defined. ###
@@ -1071,6 +1076,12 @@ class SequenceGroupMetadata(
     def prompt_adapter_num_virtual_tokens(self) -> int:
         return self.prompt_adapter_request.prompt_adapter_num_virtual_tokens \
                         if self.prompt_adapter_request else 0
+
+    # 新增
+    @property
+    def steer_vector_id(self) -> int:
+        return self.steer_vector_request.adapter_id \
+            if self.steer_vector_request else 0
 
     # Multi-Step Chunked-Prefill property
     @property
@@ -1525,6 +1536,7 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
             encoder_seq=seq_group.encoder_seq,
             trace_headers=seq_group.trace_headers,
             prompt_adapter_request=seq_group.prompt_adapter_request,
+            steer_vector_request=seq_group.steer_vector_request,  # 新增
             priority=seq_group.priority,
         )
 

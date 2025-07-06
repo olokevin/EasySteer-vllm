@@ -19,6 +19,7 @@ from vllm.beam_search import (BeamSearchInstance, BeamSearchOutput,
                               create_sort_beams_key_function)
 from vllm.config import (CompilationConfig, ModelDType, TokenizerMode,
                          is_init_field)
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.engine.arg_utils import (EngineArgs, HfOverrides, PoolerConfig,
                                    TaskOption)
 from vllm.engine.llm_engine import LLMEngine
@@ -312,6 +313,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -328,6 +330,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -344,6 +347,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -361,6 +365,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -378,6 +383,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -393,6 +399,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
     ) -> list[RequestOutput]:
@@ -413,6 +420,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
         guided_options_request: Optional[Union[LLMGuidedOptions,
                                                GuidedDecodingRequest]] = None,
         priority: Optional[list[int]] = None,
@@ -502,6 +510,7 @@ class LLM:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request, # 新增
             guided_options=guided_options_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
@@ -881,6 +890,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -896,6 +906,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -911,6 +922,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -927,6 +939,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -943,6 +956,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -957,6 +971,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         ...
 
@@ -976,6 +991,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,  # 新增
     ) -> list[PoolingRequestOutput]:
         """Apply pooling to the hidden states corresponding to the input
         prompts.
@@ -1051,6 +1067,7 @@ class LLM:
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request, # 新增
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
@@ -1227,6 +1244,7 @@ class LLM:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=None, # 新增
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
@@ -1245,6 +1263,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
     ) -> list[ScoringRequestOutput]:
         """Generate similarity scores for all pairs `<text,text_pair>`.
 
@@ -1453,6 +1472,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
         prompt_adapter_request: Optional[PromptAdapterRequest],
+        steer_vector_request: Optional[SteerVectorRequest], # 新增
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         guided_options: Optional[GuidedDecodingRequest] = None,
         priority: Optional[list[int]] = None,
@@ -1499,6 +1519,7 @@ class LLM:
                 lora_request=lora_request[i] if isinstance(
                     lora_request, Sequence) else lora_request,
                 prompt_adapter_request=prompt_adapter_request,
+                steer_vector_request=steer_vector_request, # 新增
                 priority=priority[i] if priority else 0,
             )
 
@@ -1509,6 +1530,7 @@ class LLM:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -1519,6 +1541,7 @@ class LLM:
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request, # 新增
             priority=priority,
         )
 

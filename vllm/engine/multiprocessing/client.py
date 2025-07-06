@@ -17,6 +17,7 @@ from zmq.asyncio import Socket
 
 from vllm import PoolingParams
 from vllm.config import DecodingConfig, ModelConfig, VllmConfig
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.core.scheduler import SchedulerOutputs
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -449,6 +450,7 @@ class MQLLMEngineClient(EngineClient):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request.
@@ -679,3 +681,9 @@ class MQLLMEngineClient(EngineClient):
         # Raise on error, otherwise happily return None
         if isinstance(request_output, BaseException):
             raise request_output
+
+    # 新增
+    async def add_steer_vector(self,
+                               cv_request: SteerVectorRequest) -> None:
+        """Load a new steer vector into the engine for future requests."""
+        pass

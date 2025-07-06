@@ -7,6 +7,7 @@ from typing import AsyncGenerator, Mapping, Optional
 
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
 from vllm.config import DecodingConfig, ModelConfig, VllmConfig
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
@@ -56,6 +57,7 @@ class EngineClient(ABC):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
@@ -322,5 +324,12 @@ class EngineClient(ABC):
 
     @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> None:
+        """Load a new LoRA adapter into the engine for future requests."""
+        ...
+
+    # 新增
+    @abstractmethod
+    async def add_steer_vector(self,
+                                 cv_request: SteerVectorRequest) -> None:
         """Load a new LoRA adapter into the engine for future requests."""
         ...

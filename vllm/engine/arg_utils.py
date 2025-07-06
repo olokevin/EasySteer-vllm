@@ -32,7 +32,7 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          PrefixCachingHashAlgo, PromptAdapterConfig,
                          SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
                          TaskOption, TokenizerMode, TokenizerPoolConfig,
-                         VllmConfig, get_attr_docs, get_field)
+                         VllmConfig, get_attr_docs, get_field, SteerVectorConfig) # 新增 SteerVectorConfig
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -393,6 +393,10 @@ class EngineArgs:
     max_prompt_adapters: int = PromptAdapterConfig.max_prompt_adapters
     max_prompt_adapter_token: int = \
         PromptAdapterConfig.max_prompt_adapter_token
+
+    # 新增
+    enable_steer_vector: bool = False
+    max_steer_vectors: int = 1
 
     device: Device = DeviceConfig.device
     num_scheduler_steps: int = SchedulerConfig.num_scheduler_steps
@@ -808,6 +812,15 @@ class EngineArgs:
         prompt_adapter_group.add_argument(
             "--max-prompt-adapter-token",
             **prompt_adapter_kwargs["max_prompt_adapter_token"])
+
+        # 新增
+        parser.add_argument('--enable-steer-vector',
+                            action='store_true',
+                            help='If True, enable handling of SteerVectors.')
+        parser.add_argument('--max-steer-vectors',
+                            type=int,
+                            default=EngineArgs.max_steer_vectors,
+                            help='Max number of Steer Vectors in a batch.')
 
         # Device arguments
         device_kwargs = get_kwargs(DeviceConfig)
@@ -1267,6 +1280,11 @@ class EngineArgs:
             max_prompt_adapter_token=self.max_prompt_adapter_token) \
                                         if self.enable_prompt_adapter else None
 
+        # 新增
+        steer_vector_config = SteerVectorConfig(
+            max_steer_vectors=self.max_steer_vectors,
+        ) if self.enable_steer_vector else None
+
         decoding_config = DecodingConfig(
             backend=self.guided_decoding_backend,
             disable_fallback=self.guided_decoding_disable_fallback,
@@ -1295,6 +1313,8 @@ class EngineArgs:
             decoding_config=decoding_config,
             observability_config=observability_config,
             prompt_adapter_config=prompt_adapter_config,
+            # 新增
+            steer_vector_config=steer_vector_config,
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
@@ -1387,9 +1407,23 @@ class EngineArgs:
                                recommend_to_remove=False)
             return False
 
+        # 新增
+        # No Steer Vector so far.
+        if self.enable_steer_vector:
+            _raise_or_fallback(feature_name="--enable-steer-vector",
+                               recommend_to_remove=False)
+            return False
+
         # No text embedding inputs so far.
         if self.enable_prompt_embeds:
             _raise_or_fallback(feature_name="--enable-prompt-embeds",
+                               recommend_to_remove=False)
+            return False
+
+        # Only Fp16 and Bf16 dtypes since we only support FA.
+        V1_SUPPORTED_DTYPES = [torch.bfloat16, torch.float16]
+        if model_config.dtype not in V1_SUPPORTED_DTYPES:
+            _raise_or_fallback(feature_name=f"--dtype {model_config.dtype}",
                                recommend_to_remove=False)
             return False
 
@@ -1526,6 +1560,7 @@ class EngineArgs:
                 if (is_gpu and not use_sliding_window and not use_spec_decode
                         and not self.enable_lora
                         and not self.enable_prompt_adapter
+                        and not self.enable_steer_vector # 新增
                         and model_config.runner_type != "pooling"):
                     self.enable_chunked_prefill = True
                     logger.warning(

@@ -12,6 +12,7 @@ from typing_extensions import TypeVar
 
 import vllm.platforms
 from vllm.config import VllmConfig
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -50,6 +51,7 @@ class ExecutorBase(ABC):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.steer_vector_config = vllm_config.steer_vector_config # 新增
         self._init_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
@@ -192,6 +194,21 @@ class ExecutorBase(ABC):
             assert (s == sets[0]
                     ), "All workers should have the same prompt adapters."
         return sets[0]
+
+    # 新增
+    def add_steer_vector(
+            self, steer_vector_request: SteerVectorRequest) -> bool:
+        assert steer_vector_request.adapter_id > 0, \
+            "steer vector's adapter_id must be greater than 0."
+        return all(
+            self.collective_rpc("add_steer_vector",
+                                args=(steer_vector_request,)))
+
+    def remove_steer_vector(self, steer_vector_id: int) -> bool:
+        assert steer_vector_id > 0, "cv_id must be greater than 0."
+        return all(
+            self.collective_rpc("remove_steer_vector",
+                                args=(steer_vector_id,)))
 
     def start_profile(self) -> None:
         self.collective_rpc("start_profile")

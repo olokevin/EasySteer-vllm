@@ -3083,6 +3083,16 @@ class PromptAdapterConfig:
             self.prompt_adapter_dtype = getattr(torch,
                                                 self.prompt_adapter_dtype)
 
+# 新增
+@config
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class SteerVectorConfig:
+    max_steer_vectors: int
+    adapter_dtype: Optional[torch.dtype] = torch.float16
+
+    def __post_init__(self):
+        if self.max_steer_vectors < 1:
+            raise ValueError("max_steer_vectors must be >= 1")
 
 @config
 @dataclass
@@ -4322,6 +4332,10 @@ class VllmConfig:
     """Observability configuration."""
     prompt_adapter_config: Optional[PromptAdapterConfig] = None
     """Prompt adapter configuration."""
+
+    # 新增
+    steer_vector_config: Optional[SteerVectorConfig] = None
+
     quant_config: Optional[QuantizationConfig] = None
     """Quantization configuration."""
     compilation_config: CompilationConfig = field(

@@ -96,6 +96,10 @@ class ForwardContext:
     dp_metadata: Optional[DPMetadata] = None
     skip_cuda_graphs: bool = False
 
+    # 新增
+    current_tokens: Optional[torch.Tensor] = None  # Current input tokens being processed
+    is_decode: Optional[bool] = None  # Whether we're in decode phase
+
 
 _forward_context: Optional[ForwardContext] = None
 
@@ -116,6 +120,9 @@ def set_forward_context(
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     skip_cuda_graphs: bool = False,
+    # 新增
+    current_tokens: Optional[torch.Tensor] = None,
+    is_decode: Optional[bool] = None
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -141,6 +148,8 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         dp_metadata=dp_metadata,
         skip_cuda_graphs=skip_cuda_graphs,
+        current_tokens=current_tokens,
+        is_decode=is_decode
     )
 
     try:

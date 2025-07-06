@@ -10,6 +10,7 @@ import torch.distributed
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -502,6 +503,14 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def list_prompt_adapters(self) -> Set[int]:
         return self.model_runner.list_prompt_adapters()
+
+    # 新增
+    def add_steer_vector(
+            self, steer_vector_request: SteerVectorRequest) -> bool:
+        return self.model_runner.add_steer_vector(steer_vector_request)
+
+    def remove_steer_vector(self, cv_id: int) -> bool:
+        return self.model_runner.remove_steer_vector(cv_id)
 
     @property
     def max_model_len(self) -> int:

@@ -189,6 +189,7 @@ class ModelRunnerBase(ABC, Generic[T]):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        self.steer_vector_config = vllm_config.steer_vector_config # 新增
         self.observability_config = vllm_config.observability_config
 
     # Map of request_id -> generator used for seeded random sampling
