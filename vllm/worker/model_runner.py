@@ -180,6 +180,9 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
             "multi_modal_kwargs": self.multi_modal_kwargs,
             "prompt_adapter_mapping": self.prompt_adapter_mapping,
             "prompt_adapter_requests": self.prompt_adapter_requests,
+            # 新增
+            "steer_vector_mapping": self.steer_vector_mapping,
+            "steer_vector_requests": self.steer_vector_requests,
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
