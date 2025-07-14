@@ -11,6 +11,7 @@ from .factory import create_algorithm, register_algorithm
 from .direct import DirectAlgorithm
 from .loreft import LoReFTAlgorithm
 from .multi_vector import MultiVectorAlgorithm
+from .linear import LinearTransformAlgorithm
 
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "DirectAlgorithm", 
     "LoReFTAlgorithm",
     "MultiVectorAlgorithm",
+    "LinearTransformAlgorithm",
 ] 
