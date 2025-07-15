@@ -12,6 +12,7 @@ from .direct import DirectAlgorithm
 from .loreft import LoReFTAlgorithm
 from .multi_vector import MultiVectorAlgorithm
 from .linear import LinearTransformAlgorithm
+from .lm_steer import LMSteerAlgorithm
 
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "LoReFTAlgorithm",
     "MultiVectorAlgorithm",
     "LinearTransformAlgorithm",
+    "LMSteerAlgorithm",
 ] 
