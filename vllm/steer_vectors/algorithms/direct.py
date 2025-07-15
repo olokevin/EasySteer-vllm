@@ -26,14 +26,62 @@ class DirectAlgorithm(AlgorithmTemplate):
 
     @classmethod
     def load_from_path(cls, path: str, device: str, **kwargs) -> dict:
-        """从GGUF文件加载Direct控制向量"""
-        import gguf
-        import numpy as np
-
+        """从GGUF文件或PT文件加载Direct控制向量"""
+        import os
+        
         config = kwargs.get("config")
         if config is None:
             raise ValueError("DirectAlgorithm.load_from_path requires 'config' in kwargs")
-
+            
+        file_ext = os.path.splitext(path)[1].lower()
+        
+        if file_ext == '.pt':
+            return cls._load_from_pt(path, device, **kwargs)
+        else:  # 默认为gguf格式
+            return cls._load_from_gguf(path, device, **kwargs)
+    
+    @classmethod
+    def _load_from_pt(cls, path: str, device: str, **kwargs) -> dict:
+        """从PT文件加载Direct控制向量"""
+        import torch
+        
+        config = kwargs.get("config")
+        target_layers = kwargs.get("target_layers")
+        if target_layers is None:
+            raise ValueError("Loading .pt files requires 'target_layers' in kwargs")
+            
+        # 使用第一个目标层作为加载PT文件的层
+        if not target_layers:
+            raise ValueError("target_layers list cannot be empty")
+            
+        target_layer = target_layers[0]
+        
+        try:
+            # 加载PT文件中的张量
+            vector = torch.load(path, map_location=device)
+            
+            # 确保向量格式正确并转换到所需数据类型
+            if not isinstance(vector, torch.Tensor):
+                raise ValueError(f"PT file does not contain a tensor: {type(vector)}")
+                
+            vector = vector.to(device).to(config.adapter_dtype)
+            
+            # 使用指定的目标层
+            sv_weights = {target_layer: vector}
+            
+            return {"layer_payloads": sv_weights}
+            
+        except Exception as e:
+            raise ValueError(f"Failed to load PT file: {e}") from e
+    
+    @classmethod
+    def _load_from_gguf(cls, path: str, device: str, **kwargs) -> dict:
+        """从GGUF文件加载Direct控制向量"""
+        import gguf
+        import numpy as np
+        
+        config = kwargs.get("config")
+        
         reader = gguf.GGUFReader(path)
         
         # 验证文件类型
