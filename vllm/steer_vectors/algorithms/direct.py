@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Optional, Union, Any
 import torch
+import numpy as np
 
 from .template import AlgorithmTemplate
 from .factory import register_algorithm
@@ -58,11 +59,15 @@ class DirectAlgorithm(AlgorithmTemplate):
         
         try:
             # 加载PT文件中的张量
-            vector = torch.load(path, map_location=device)
+            # Use weights_only=False to handle PyTorch 2.6+ behavior
+            vector = torch.load(path, map_location=device, weights_only=False)
             
+            # 处理numpy数组，转换为tensor
+            if isinstance(vector, np.ndarray):
+                vector = torch.tensor(vector, device=device)
             # 确保向量格式正确并转换到所需数据类型
-            if not isinstance(vector, torch.Tensor):
-                raise ValueError(f"PT file does not contain a tensor: {type(vector)}")
+            elif not isinstance(vector, torch.Tensor):
+                raise ValueError(f"PT file does not contain a tensor or numpy array: {type(vector)}")
                 
             vector = vector.to(device).to(config.adapter_dtype)
             
