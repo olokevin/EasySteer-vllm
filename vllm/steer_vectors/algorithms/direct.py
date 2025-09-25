@@ -27,12 +27,15 @@ class DirectAlgorithm(AlgorithmTemplate):
 
     @classmethod
     def load_from_path(cls, path: str, device: str, **kwargs) -> dict:
-        """从GGUF文件或PT文件加载Direct控制向量"""
+        """从GGUF文件、PT文件或ReFT目录加载Direct控制向量"""
         import os
         
         config = kwargs.get("config")
         if config is None:
             raise ValueError("DirectAlgorithm.load_from_path requires 'config' in kwargs")
+
+        if os.path.isdir(path):
+            return cls._load_from_reft_dir(path, device, **kwargs)
             
         file_ext = os.path.splitext(path)[1].lower()
         
@@ -110,6 +113,91 @@ class DirectAlgorithm(AlgorithmTemplate):
             np_copy = np.array(tensor.data, copy=True)
             sv_weights[layer] = torch.from_numpy(np_copy).to(device).to(config.adapter_dtype)
             
+        return {"layer_payloads": sv_weights}
+
+    @classmethod
+    def _load_from_reft_dir(cls, path: str, device: str, **kwargs) -> dict:
+        """从ReFT目录加载控制向量 (例如 BiasIntervention)"""
+        import os
+        import glob
+        import json
+        import torch
+
+        config = kwargs.get("config")
+        target_layers = kwargs.get("target_layers")
+
+        if not os.path.isdir(path):
+            raise ValueError(f"For ReFT algorithm, path must be a directory. Got: {path}")
+
+        bin_files = glob.glob(os.path.join(path, "*.bin"))
+        if not bin_files:
+            raise ValueError(f"No .bin files found in directory: {path}")
+        if len(bin_files) > 1:
+            raise ValueError(f"Multiple .bin files found in directory {path}. Please ensure only one exists.")
+        
+        bin_file_path = bin_files[0]
+
+        config_files = [os.path.join(path, f) for f in ["reft_config.json", "config.json"] if os.path.exists(os.path.join(path, f))]
+        if not config_files:
+            raise ValueError(f"No config file (reft_config.json or config.json) found in directory: {path}")
+        if len(config_files) > 1:
+            raise ValueError(f"Multiple config files found in directory {path}. Please ensure only one exists.")
+        
+        config_file_path = config_files[0]
+
+        with open(config_file_path, 'r') as f:
+            config_data = json.load(f)
+
+        config_layer_idx = None
+        if "representations" in config_data:
+            representations = config_data.get("representations", [])
+            if representations:
+                first_repr = representations[0]
+                if isinstance(first_repr, dict):
+                    config_layer_idx = first_repr.get("layer")
+                # Support for older list-based representation format
+                elif isinstance(first_repr, list) and len(first_repr) > 0:
+                    config_layer_idx = first_repr[0]
+
+
+        if config_layer_idx is None:
+            bin_filename = os.path.basename(bin_file_path)
+            if "intkey_layer_" in bin_filename:
+                try:
+                    layer_str = bin_filename.split("intkey_layer_")[1].split("_")[0]
+                    config_layer_idx = int(layer_str)
+                except (ValueError, IndexError):
+                    pass
+        
+        if config_layer_idx is None:
+            raise ValueError(f"Could not extract layer info from config {config_file_path} or filename {os.path.basename(bin_file_path)}")
+
+        if target_layers and config_layer_idx not in target_layers:
+            raise ValueError(f"Layer mismatch: config specifies layer {config_layer_idx}, but target_layers is {target_layers}.")
+
+        state_dict = torch.load(bin_file_path, map_location=device)
+        
+        vector = None
+        adapter_dtype = config.adapter_dtype if hasattr(config, 'adapter_dtype') else torch.float16
+
+        if len(state_dict) == 1:
+            vector = list(state_dict.values())[0]
+        elif 'source_representation' in state_dict:
+            vector = state_dict['source_representation']
+        elif 'bias' in state_dict:
+            vector = state_dict['bias']
+        elif 'weight' in state_dict:
+            vector = state_dict['weight']
+        else:
+            raise ValueError(f"Could not determine the correct tensor from .bin file with multiple tensors. Keys found: {list(state_dict.keys())}")
+        
+        if not isinstance(vector, torch.Tensor):
+            raise ValueError(f"Loaded payload is not a tensor. Type: {type(vector)}")
+            
+        vector = vector.to(device).to(adapter_dtype)
+        
+        sv_weights = {config_layer_idx: vector}
+        
         return {"layer_payloads": sv_weights}
 
     def reset_steer_vector(self, index: int) -> None:

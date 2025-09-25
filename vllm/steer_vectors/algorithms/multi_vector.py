@@ -44,6 +44,42 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         """设置冲突解决策略"""
         self.conflict_resolution = conflict_resolution
 
+    def _apply_global_vectors(self, hidden_states: torch.Tensor, vectors_in_order: List[Tuple[int, AlgorithmTemplate]], phase: str) -> torch.Tensor:
+        """
+        当所有向量都在某阶段（prefill/generate）对全部 token 生效（触发器为 [-1] 且无位置触发）时，
+        走快速路径，避免构建按位置/样本的映射。
+
+        Args:
+            hidden_states: 需要变换的 hidden states（prefill: [T, H]，generate: [B, H]）。
+            vectors_in_order: 需要应用的向量（保持插入顺序）。
+            phase: 'prefill' 或 'generate'，仅用于日志。
+        """
+        if not vectors_in_order:
+            return hidden_states
+
+        if self.conflict_resolution == "error" and len(vectors_in_order) > 1:
+            raise ValueError(
+                f"Multiple global vectors conflict in {phase} phase: "
+                f"vector indices {[vid for vid, _ in vectors_in_order]}"
+            )
+
+        # priority: 仅使用第一个； sequential: 顺序全部应用
+        to_apply: List[Tuple[int, AlgorithmTemplate]] = (
+            [vectors_in_order[0]] if self.conflict_resolution == "priority" else vectors_in_order
+        )
+
+        for vec_idx, algo in to_apply:
+            algo.set_active_tensor(0)
+            params = algo._get_params()
+            if not algo._is_valid(params):
+                continue
+            original_dtype = hidden_states.dtype
+            hidden_states = algo._transform(hidden_states, params).to(original_dtype)
+            if self.debug:
+                print(f"[MultiVector] FastPath({phase}) applied vector {vec_idx} to ALL")
+
+        return hidden_states
+
     def add_vector(self, vector_idx: int, algorithm_type: str, **kwargs) -> None:
         """添加一个向量到多向量管理器"""
         # 提取构造函数参数 (如 normalize)
@@ -197,45 +233,106 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
         解决冲突阶段：根据conflict_resolution策略处理冲突
         
         Args:
-            position_to_vectors: 每个位置/样本的向量列表
+            position_to_vectors: 每个位置/样本的向量列表 (会被就地修改)
             
         Returns:
             解决冲突后的映射
         """
-        resolved = {}
-        
-        for pos, vectors in position_to_vectors.items():
-            if len(vectors) <= 1:
-                # 没有冲突
-                resolved[pos] = vectors
-            else:
-                # 存在冲突
-                if self.conflict_resolution == "error":
-                    vector_indices = [v.vector_idx for v in vectors]
-                    raise ValueError(
-                        f"Multiple vectors conflict at position/sample {pos}: "
-                        f"vector indices {vector_indices}. "
-                        f"Set conflict_resolution='priority' to use the first vector, "
-                        f"or 'sequential' to apply all vectors in sequence."
-                    )
-                elif self.conflict_resolution == "priority":
-                    # 使用第一个向量
-                    resolved[pos] = [vectors[0]]
-                    if self.debug:
-                        vector_indices = [v.vector_idx for v in vectors]
-                        print(f"[MultiVector] Conflict at position {pos}: "
-                              f"vectors {vector_indices}, using vector {vectors[0].vector_idx} (priority mode)")
-                elif self.conflict_resolution == "sequential":
-                    # 保留所有向量，按顺序应用
-                    resolved[pos] = vectors
-                    if self.debug:
+        # In 'sequential' mode, no conflict resolution is necessary; all vectors are applied in order.
+        # We can return early to avoid an unnecessary loop.
+        if self.conflict_resolution == "sequential":
+            if self.debug:
+                for pos, vectors in position_to_vectors.items():
+                    if len(vectors) > 1:
                         vector_indices = [v.vector_idx for v in vectors]
                         print(f"[MultiVector] Conflict at position {pos}: "
                               f"vectors {vector_indices}, applying all in sequence (sequential mode)")
-                else:
-                    raise ValueError(f"Unknown conflict resolution strategy: {self.conflict_resolution}")
-                        
-        return resolved
+            return position_to_vectors
+
+        # For 'error' or 'priority' modes, we iterate to find and handle conflicts.
+        if self.conflict_resolution in ["error", "priority"]:
+            for pos, vectors in position_to_vectors.items():
+                if len(vectors) > 1:
+                    # A conflict exists.
+                    if self.conflict_resolution == "error":
+                        vector_indices = [v.vector_idx for v in vectors]
+                        raise ValueError(
+                            f"Multiple vectors conflict at position/sample {pos}: "
+                            f"vector indices {vector_indices}. "
+                            f"Set conflict_resolution='priority' to use the first vector, "
+                            f"or 'sequential' to apply all vectors in sequence."
+                        )
+                    elif self.conflict_resolution == "priority":
+                        # Use the first vector.
+                        position_to_vectors[pos] = [vectors[0]]
+                        if self.debug:
+                            vector_indices = [v.vector_idx for v in vectors]
+                            print(f"[MultiVector] Conflict at position {pos}: "
+                                  f"vectors {vector_indices}, using vector {vectors[0].vector_idx} (priority mode)")
+            return position_to_vectors
+        
+        # If we reach here, the strategy is unknown.
+        raise ValueError(f"Unknown conflict resolution strategy: {self.conflict_resolution}")
+
+    def _apply_vectorized(self, hidden_states: torch.Tensor, resolved_mapping: Dict[int, List[VectorInstance]], target_name: str):
+        """
+        Vectorized application of transformations.
+        
+        Args:
+            hidden_states: The tensor to modify.
+            resolved_mapping: A map from index (sample_idx or pos) to a list of vector instances to apply.
+            target_name: A string ('sample' or 'position') for logging.
+        """
+        if not resolved_mapping:
+            return
+
+        # Find the maximum number of vectors to apply sequentially to any single item.
+        max_depth = max((len(v) for v in resolved_mapping.values()), default=0)
+
+        # Apply vectors layer by layer to handle sequential application.
+        for depth in range(max_depth):
+            # Group indices by vector_idx for the current application depth.
+            vector_to_indices: Dict[int, List[int]] = {}
+            for idx, vectors in resolved_mapping.items():
+                if len(vectors) > depth:
+                    instance = vectors[depth]
+                    vector_idx = instance.vector_idx
+                    if vector_idx not in vector_to_indices:
+                        vector_to_indices[vector_idx] = []
+                    vector_to_indices[vector_idx].append(idx)
+            
+            # Apply transformations for all vectors at the current depth.
+            for vector_idx, indices in vector_to_indices.items():
+                if not indices:
+                    continue
+
+                algo = self.vector_algorithms.get(vector_idx)
+                if not algo:
+                    continue
+                    
+                # Activate the algorithm and get its parameters.
+                algo.set_active_tensor(0)  # Use index 0 for internal storage.
+                params = algo._get_params()
+                if not algo._is_valid(params):
+                    continue
+                
+                # Perform the vectorized transformation.
+                valid_indices = sorted([i for i in indices if i < hidden_states.shape[0]])
+                if not valid_indices:
+                    continue
+                
+                indices_tensor = torch.tensor(valid_indices, device=hidden_states.device, dtype=torch.long)
+                
+                selected_states = hidden_states.index_select(0, indices_tensor)
+                original_dtype = selected_states.dtype
+                
+                transformed_states = algo._transform(selected_states, params).to(original_dtype)
+                
+                hidden_states.index_copy_(0, indices_tensor, transformed_states)
+
+                if self.debug:
+                    print(f"[MultiVector] Applied vector {vector_idx} to {target_name}s: {valid_indices} at depth {depth}")
+
 
     def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """应用多向量干预"""
@@ -252,51 +349,61 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
 
         is_decode = forward_ctx.is_decode
 
-        # 收集阶段
+        # 收集、解决冲突、然后应用
         if is_decode:
             # Generate phase
+            # Fast path: 所有向量均对全部样本生效（generate_trigger_tokens == {-1} 且无其他触发）
+            global_only_vectors: List[Tuple[int, AlgorithmTemplate]] = []
+            mixed_case = False
+            for vid, algo in self.vector_algorithms.items():
+                if algo.generate_trigger_tokens is None and algo.prefill_trigger_positions is None:
+                    continue
+                # 仅当 generate 触发器为 {-1} 且无其他 generate 触发条件时视为全局
+                is_global_only = (
+                    algo.generate_trigger_tokens is not None and
+                    (-1 in algo.generate_trigger_tokens) and
+                    len(algo.generate_trigger_tokens) == 1
+                )
+                if is_global_only:
+                    global_only_vectors.append((vid, algo))
+                elif algo.generate_trigger_tokens is not None:
+                    mixed_case = True
+
+            if global_only_vectors and not mixed_case:
+                # 所有向量都是全局触发，直接快速路径
+                hidden_states = self._apply_global_vectors(hidden_states, global_only_vectors, "generate")
+                return hidden_states
+
             sample_to_vectors = self._gather_applicable_vectors_generate(hidden_states, forward_ctx)
-            # 解决冲突
             resolved_mapping = self._resolve_conflicts(sample_to_vectors)
-            
-            # 应用阶段：对每个样本顺序应用其对应的向量
-            for sample_idx, vectors in resolved_mapping.items():
-                if sample_idx < hidden_states.shape[0]:
-                    # 顺序应用每个向量
-                    for vector_instance in vectors:
-                        algo = vector_instance.algorithm
-                        # 临时设置算法的active状态
-                        algo.set_active_tensor(0)  # Use index 0 for internal storage
-                        
-                        # 获取算法参数并应用变换
-                        params = algo._get_params()
-                        if algo._is_valid(params):
-                            hidden_states[sample_idx] = algo._transform(hidden_states[sample_idx], params)
-                            
-                        if self.debug:
-                            print(f"[MultiVector] Applied vector {vector_instance.vector_idx} to sample {sample_idx}")
+            self._apply_vectorized(hidden_states, resolved_mapping, "sample")
         else:
             # Prefill phase
+            # Fast path: 所有向量均对全部 token 生效（prefill_trigger_tokens == {-1} 且无位置触发）
+            global_only_vectors: List[Tuple[int, AlgorithmTemplate]] = []
+            mixed_case = False
+            for vid, algo in self.vector_algorithms.items():
+                if not algo._has_prefill_triggers():
+                    continue
+                is_global_only = (
+                    algo.prefill_trigger_tokens is not None and
+                    (-1 in algo.prefill_trigger_tokens) and
+                    len(algo.prefill_trigger_tokens) == 1 and
+                    algo.prefill_trigger_positions is None
+                )
+                if is_global_only:
+                    global_only_vectors.append((vid, algo))
+                else:
+                    mixed_case = True
+
+            if global_only_vectors and not mixed_case:
+                # 所有向量都是全局触发，直接快速路径
+                hidden_states = self._apply_global_vectors(hidden_states, global_only_vectors, "prefill")
+                return hidden_states
+
             position_to_vectors = self._gather_applicable_vectors_prefill(hidden_states, forward_ctx)
-            # 解决冲突
             resolved_mapping = self._resolve_conflicts(position_to_vectors)
-            
-            # 应用阶段：对每个位置顺序应用其对应的向量
-            for pos, vectors in resolved_mapping.items():
-                if pos < hidden_states.shape[0]:
-                    # 顺序应用每个向量
-                    for vector_instance in vectors:
-                        algo = vector_instance.algorithm
-                        # 临时设置算法的active状态
-                        algo.set_active_tensor(0)  # Use index 0 for internal storage
-                        
-                        # 获取算法参数并应用变换
-                        params = algo._get_params()
-                        if algo._is_valid(params):
-                            hidden_states[pos] = algo._transform(hidden_states[pos], params)
-                            
-                        if self.debug:
-                            print(f"[MultiVector] Applied vector {vector_instance.vector_idx} to position {pos}")
+            self._apply_vectorized(hidden_states, resolved_mapping, "position")
 
         return hidden_states
 

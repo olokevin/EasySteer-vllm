@@ -58,7 +58,7 @@ _decoder_layer_class_names = [
     "StablelmDecoderLayer", "WhisperDecoderLayer", "Zamba2AttentionDecoderLayer",
     "Zamba2MambaDecoderLayer", "ChameleonDecoderLayer", "ChameleonSwinDecoderLayer",
     "BambaMixerDecoderLayer", "BambaAttentionDecoderLayer", "BaiChuanDecoderLayer",
-    "ArcticDecoderLayer", "AriaTextDecoderLayer"
+    "ArcticDecoderLayer", "AriaTextDecoderLayer", "GPT2Block"
 ]
 
 

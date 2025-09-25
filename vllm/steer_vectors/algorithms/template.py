@@ -92,26 +92,31 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
                 if self.debug:
                     print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
                           f"Applying transformation to ALL {batch_size} samples in generate phase")
-                # 对所有样本应用变换
-                for sample_idx in range(batch_size):
-                    hidden_states[sample_idx] = self._transform(hidden_states[sample_idx], params)
+                # 对所有样本应用变换 (Vectorized)
+                original_dtype = hidden_states.dtype
+                hidden_states = self._transform(hidden_states, params).to(original_dtype)
             else:
                 # 检查每个样本的当前token
-                samples_to_apply = set()
-                for i in range(min(batch_size, current_tokens.shape[0])):
-                    token_id = current_tokens[i].item()
-                    if token_id in self.generate_trigger_tokens:
-                        samples_to_apply.add(i)
-                        if self.debug:
-                            print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
-                                  f"Sample {i} triggered by token {token_id}")
+                samples_to_apply = {
+                    i
+                    for i in range(min(batch_size, current_tokens.shape[0]))
+                    if current_tokens[i].item() in self.generate_trigger_tokens
+                }
 
                 if samples_to_apply:
                     if self.debug:
                         print(f"[{self.__class__.__name__}] Applying transformation to generate samples: {samples_to_apply}")
-                    for sample_idx in samples_to_apply:
-                        if sample_idx < hidden_states.shape[0]:
-                            hidden_states[sample_idx] = self._transform(hidden_states[sample_idx], params)
+                    
+                    # (Vectorized)
+                    indices_to_apply = sorted(list(samples_to_apply))
+                    if indices_to_apply:
+                        # Ensure indices are valid
+                        valid_indices = [i for i in indices_to_apply if i < hidden_states.shape[0]]
+                        if valid_indices:
+                            indices_tensor = torch.tensor(valid_indices, device=hidden_states.device, dtype=torch.long)
+                            selected_states = hidden_states.index_select(0, indices_tensor)
+                            transformed_states = self._transform(selected_states, params).to(selected_states.dtype)
+                            hidden_states.index_copy_(0, indices_tensor, transformed_states)
 
         return hidden_states
     
@@ -126,8 +131,8 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
             if self.debug:
                 print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
                       f"Applying transformation to ALL {total_tokens} tokens in prefill phase")
-            for pos in range(total_tokens):
-                hidden_states[pos] = self._transform(hidden_states[pos], params)
+            original_dtype = hidden_states.dtype
+            hidden_states = self._transform(hidden_states, params).to(original_dtype)
         else:
             # 收集所有需要应用变换的位置
             positions_to_apply = []
@@ -190,9 +195,14 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
             if positions_to_apply:
                 if self.debug:
                     print(f"[{self.__class__.__name__}] Applying transformation to {len(positions_to_apply)} token positions: {positions_to_apply}")
-                for pos in positions_to_apply:
-                    if pos < hidden_states.shape[0]:
-                        hidden_states[pos] = self._transform(hidden_states[pos], params)
+                
+                # (Vectorized)
+                valid_positions = [p for p in positions_to_apply if p < hidden_states.shape[0]]
+                if valid_positions:
+                    positions_tensor = torch.tensor(valid_positions, device=hidden_states.device, dtype=torch.long)
+                    selected_states = hidden_states.index_select(0, positions_tensor)
+                    transformed_states = self._transform(selected_states, params).to(selected_states.dtype)
+                    hidden_states.index_copy_(0, positions_tensor, transformed_states)
 
         return hidden_states
 
