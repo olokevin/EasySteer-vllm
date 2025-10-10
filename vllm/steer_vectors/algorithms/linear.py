@@ -3,14 +3,14 @@ from typing import Optional, Dict, Any, Tuple
 import torch
 import logging
 
-from .base import BaseSteerVectorAlgorithm
+from .template import AlgorithmTemplate
 from .factory import register_algorithm
 
 logger = logging.getLogger(__name__)
 
 
 @register_algorithm("linear")
-class LinearTransformAlgorithm(BaseSteerVectorAlgorithm):
+class LinearTransformAlgorithm(AlgorithmTemplate):
     """
     线性变换算法：wh+b
     
@@ -20,10 +20,12 @@ class LinearTransformAlgorithm(BaseSteerVectorAlgorithm):
 
     def __init__(self, layer_id=None, normalize=False):
         super().__init__(layer_id)
+        # normalize is accepted for signature consistency, but not used.
         self.weights = {}  # 保存权重矩阵W
         self.biases = {}   # 保存偏置向量b
         self.scale_factors = {}  # 保存缩放因子
         self.active_tensor_index = None
+        self.active_params: Optional[dict] = None
 
     def set_steer_vector(self, index: int, **kwargs):
         """设置权重矩阵和偏置向量"""
@@ -53,40 +55,51 @@ class LinearTransformAlgorithm(BaseSteerVectorAlgorithm):
     def set_active_tensor(self, index: int):
         """设置当前激活的张量索引"""
         self.active_tensor_index = index
+        if index is not None and index in self.weights:
+            weight = self.weights[index]
+            bias = self.biases.get(index, None)
+            scale = self.scale_factors.get(index, 1.0)
+            
+            self.active_params = {
+                "weight": weight,
+                "bias": bias,
+                "scale": scale
+            }
+        else:
+            self.active_params = None
+
+    # 实现算法模板要求的抽象方法
+    def _get_params(self) -> Optional[dict]:
+        """获取当前激活的算法参数"""
+        return self.active_params
+
+    def _is_valid(self, params: Any) -> bool:
+        """检查算法参数是否有效"""
+        return (params is not None and 
+                isinstance(params, dict) and 
+                "weight" in params)
+
+    def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
+        """对单个token进行线性变换: wh+b * scale"""
+        weight = params["weight"]
+        bias = params.get("bias", None)
+        scale = params.get("scale", 1.0)
         
-    def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """应用线性变换干预 wh+b"""
-        if self.active_tensor_index is None or self.active_tensor_index not in self.weights:
-            return hidden_states
-            
-        # 检查是否可以应用控制向量 (对应于触发条件逻辑)
-        if not self._should_apply_steer_vector(hidden_states):
-            return hidden_states
-
-        # 获取当前激活的权重、偏置和缩放因子
-        weight = self.weights[self.active_tensor_index]
-        bias = self.biases.get(self.active_tensor_index, None)
-        scale = self.scale_factors.get(self.active_tensor_index, 1.0)
-
-        # 确保权重和偏置的数据类型与hidden_states匹配
-        if weight.dtype != hidden_states.dtype:
-            weight = weight.to(dtype=hidden_states.dtype)
-            self.weights[self.active_tensor_index] = weight  # 更新缓存，避免重复转换
-            
-        if bias is not None and bias.dtype != hidden_states.dtype:
-            bias = bias.to(dtype=hidden_states.dtype)
-            self.biases[self.active_tensor_index] = bias  # 更新缓存，避免重复转换
-
+        # 确保数据类型匹配
+        device = hidden_state.device
+        dtype = hidden_state.dtype
+        
+        weight = weight.to(device).to(dtype)
+        if bias is not None:
+            bias = bias.to(device).to(dtype)
+        
         # 检查维度匹配
-        if weight.shape[0] != hidden_states.shape[-1]:
-            logger.error(f"维度不匹配: weight shape={weight.shape}, hidden_states shape={hidden_states.shape}")
-            return hidden_states
-
+        if weight.shape[0] != hidden_state.shape[-1]:
+            logger.error(f"维度不匹配: weight shape={weight.shape}, hidden_state shape={hidden_state.shape}")
+            return hidden_state
+        
         # 应用权重矩阵：矩阵乘法
-        # 维度重排以进行批量矩阵乘法
-        orig_shape = hidden_states.shape
-        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])  # [batch*seq*..., hidden_dim]
-        transformed = torch.matmul(flat_hidden, weight.T)  # [batch*seq*..., hidden_dim]
+        transformed = torch.matmul(hidden_state, weight.T)
         
         # 如果有偏置，添加偏置
         if bias is not None:
@@ -96,107 +109,7 @@ class LinearTransformAlgorithm(BaseSteerVectorAlgorithm):
         if scale != 1.0:
             transformed = transformed * scale
             
-        # 恢复原始维度
-        transformed = transformed.reshape(orig_shape)
-        
-        # 调试日志
-        if self.debug:
-            logger.info(f"Layer {self.layer_id}: Applied linear transform with scale {scale}")
-            
         return transformed
-
-    def _should_apply_steer_vector(self, hidden_states: torch.Tensor) -> bool:
-        """检查当前token是否应该应用控制向量"""
-        # 没有配置任何触发器时，对所有token都应用
-        if (not self._has_prefill_triggers() and 
-            self.generate_trigger_tokens is None):
-            return True
-            
-        # 尝试从context获取当前token和位置信息
-        try:
-            from vllm.forward_context import get_forward_context
-            if get_forward_context is None:
-                # 如果无法获取context，默认应用控制向量
-                return True
-                
-            ctx = get_forward_context()
-            if ctx is None:
-                return True
-                
-            # 检查是否在prefill或decode阶段
-            # ForwardContext对象有is_decode属性，我们用它来区分阶段
-            if not hasattr(ctx, 'is_decode') or not ctx.is_decode:
-                # prefill阶段
-                # 检查是否对所有prefill token应用
-                if self._should_apply_to_all_prefill_tokens():
-                    return True
-                    
-                # 检查token id触发器
-                if (self.prefill_trigger_tokens is not None and 
-                    hasattr(ctx, 'token_id') and
-                    ctx.token_id in self.prefill_trigger_tokens):
-                    return True
-                    
-                # 检查位置触发器
-                if self.prefill_trigger_positions is not None:
-                    # 获取seq_len和当前位置
-                    if not hasattr(ctx, 'seq_start_loc'):
-                        # 没有位置信息，保险起见应用控制向量
-                        return True
-                    
-                    if not hasattr(ctx, 'position'):
-                        return True
-                        
-                    # 解析相对位置为绝对位置
-                    pos = ctx.position
-                    trigger_positions = self._resolve_positions_per_sample(
-                        self.prefill_trigger_positions, ctx.seq_start_loc)
-                        
-                    if pos in trigger_positions:
-                        return True
-                return False
-            else:
-                # decode/generate阶段
-                # 检查是否对所有generate token应用
-                if self._should_apply_to_all_generate_tokens():
-                    return True
-                    
-                # 检查token id触发器
-                if (self.generate_trigger_tokens is not None and 
-                    hasattr(ctx, 'token_id') and
-                    ctx.token_id in self.generate_trigger_tokens):
-                    return True
-                    
-                return False
-        except Exception as e:
-            # 出现异常时保险起见应用控制向量
-            if self.debug:
-                logger.warning(f"Error in _should_apply_steer_vector: {e}")
-            return True
-
-    def forward_decoder_layer(self, output):
-        """应用线性变换 wh+b 到隐藏状态"""
-        # 没有激活的向量，直接返回原始输出
-        if self.active_tensor_index is None or self.active_tensor_index not in self.weights:
-            return output
-
-        # 从DecoderLayer输出中提取hidden_states
-        from vllm.steer_vectors.layers import _extract_hidden_states_and_residual, _reconstruct_output
-        hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
-
-        # 应用干预
-        transformed = self.apply_intervention(hidden_states)
-        
-        # 如果没有变化，直接返回原始输出
-        if transformed is hidden_states:
-            return output
-            
-        # 重构并返回修改后的输出
-        return _reconstruct_output(transformed, residual, other_outputs, original_format, output)
-        
-    def forward_mlp_layer(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MLP层的forward处理，简单转发到apply_intervention"""
-        return self.apply_intervention(hidden_states)
 
     @classmethod
     def load_from_path(cls, file_path: str, device: str, config=None, target_layers=None):

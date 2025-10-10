@@ -3,14 +3,14 @@ from typing import Optional, Dict, Any, Tuple
 import torch
 import logging
 
-from .base import BaseSteerVectorAlgorithm
+from .template import AlgorithmTemplate
 from .factory import register_algorithm
 
 logger = logging.getLogger(__name__)
 
 
 @register_algorithm("lm_steer")
-class LMSteerAlgorithm(BaseSteerVectorAlgorithm):
+class LMSteerAlgorithm(AlgorithmTemplate):
     """
     LM-Steer算法
     
@@ -20,10 +20,12 @@ class LMSteerAlgorithm(BaseSteerVectorAlgorithm):
 
     def __init__(self, layer_id=None, normalize=False):
         super().__init__(layer_id)
+        # normalize is accepted for signature consistency, but not used.
         self.projector1 = {}  # 保存投影矩阵P1
         self.projector2 = {}  # 保存投影矩阵P2
         self.scale_factors = {}  # 保存缩放因子α
         self.active_tensor_index = None
+        self.active_params: Optional[dict] = None
 
     def set_steer_vector(self, index: int, **kwargs):
         """设置投影矩阵和缩放因子"""
@@ -38,7 +40,7 @@ class LMSteerAlgorithm(BaseSteerVectorAlgorithm):
         if "projector1" in payload and "projector2" in payload:
             self.projector1[index] = payload["projector1"]
             self.projector2[index] = payload["projector2"]
-            logger.info(f"Set projector matrices for index {index}")
+            # logger.info(f"Set projector matrices for index {index}")
         else:
             logger.warning(f"Missing required 'projector1'/'projector2' in payload for layer {self.layer_id}")
             return
@@ -59,153 +61,61 @@ class LMSteerAlgorithm(BaseSteerVectorAlgorithm):
     def set_active_tensor(self, index: int):
         """设置当前激活的张量索引"""
         self.active_tensor_index = index
-        
-    def apply_intervention(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """应用干预公式：h = h + α*((h·P1)·P2^T)"""
-        if self.active_tensor_index is None:
-            return hidden_states
+        if index is not None and index in self.projector1 and index in self.projector2:
+            P1 = self.projector1[index]
+            P2 = self.projector2[index]
+            alpha = self.scale_factors.get(index, 1.0)
             
-        # 检查是否可以应用控制向量
-        if not self._should_apply_steer_vector(hidden_states):
-            return hidden_states
+            # 选择第一个steer向量(索引0) 如果是多维的
+            if P1.dim() > 2:
+                P1_active = P1[0]  # shape: [embed_dim, rank]
+            else:
+                P1_active = P1
+                
+            if P2.dim() > 2:
+                P2_active = P2[0]  # shape: [embed_dim, rank]
+            else:
+                P2_active = P2
+            
+            self.active_params = {
+                "P1": P1_active,
+                "P2": P2_active,
+                "alpha": alpha
+            }
+        else:
+            self.active_params = None
 
-        # 获取当前激活的索引
-        index = self.active_tensor_index
-        alpha = self.scale_factors.get(index, 1.0)
-        
-        if index not in self.projector1 or index not in self.projector2:
-            logger.warning(f"Projector matrices not found for index {index}")
-            return hidden_states
-            
-        # 获取投影矩阵
-        P1 = self.projector1[index]  # shape: [num_steers, embed_dim, rank]
-        P2 = self.projector2[index]  # shape: [num_steers, embed_dim, rank]
+    # 实现算法模板要求的抽象方法
+    def _get_params(self) -> Optional[dict]:
+        """获取当前激活的算法参数"""
+        return self.active_params
+
+    def _is_valid(self, params: Any) -> bool:
+        """检查算法参数是否有效"""
+        return (params is not None and 
+                isinstance(params, dict) and 
+                "P1" in params and 
+                "P2" in params)
+
+    def _transform(self, hidden_state: torch.Tensor, params: dict) -> torch.Tensor:
+        """对单个token进行LM-Steer变换: h = h + α*((h·P1)·P2^T)"""
+        P1 = params["P1"]
+        P2 = params["P2"]
+        alpha = params.get("alpha", 1.0)
         
         # 确保数据类型匹配
-        if P1.dtype != hidden_states.dtype:
-            P1 = P1.to(dtype=hidden_states.dtype)
-            self.projector1[index] = P1
-            
-        if P2.dtype != hidden_states.dtype:
-            P2 = P2.to(dtype=hidden_states.dtype)
-            self.projector2[index] = P2
+        device = hidden_state.device
+        dtype = hidden_state.dtype
         
-        # 选择第一个steer向量(索引0)
-        P1_active = P1[0]  # shape: [embed_dim, rank]
-        P2_active = P2[0]  # shape: [embed_dim, rank]
-        
-        # 保存原始维度
-        orig_shape = hidden_states.shape
-        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])  # [batch*seq*..., hidden_dim]
+        P1 = P1.to(device).to(dtype)
+        P2 = P2.to(device).to(dtype)
         
         # 应用低秩变换: (h·P1)·P2^T
-        transformed = torch.matmul(flat_hidden, P1_active)  # [batch*seq, rank]
-        transformed = torch.matmul(transformed, P2_active.transpose(0, 1))  # [batch*seq, hidden_dim]
+        transformed = torch.matmul(hidden_state, P1)  # [..., rank]
+        transformed = torch.matmul(transformed, P2.transpose(-2, -1))  # [..., hidden_dim]
         
-        # 应用缩放因子并添加原始隐藏状态：h = h + α*((h·P1)·P2^T)
-        transformed = flat_hidden + alpha * transformed
-        
-        # 恢复原始维度
-        transformed = transformed.reshape(orig_shape)
-        
-        # 调试日志
-        if self.debug:
-            logger.info(f"Layer {self.layer_id}: Applied LM-Steer transform with scale {alpha}")
-            
-        return transformed
-
-    def _should_apply_steer_vector(self, hidden_states: torch.Tensor) -> bool:
-        """检查当前token是否应该应用控制向量"""
-        # 没有配置任何触发器时，对所有token都应用
-        if (not self._has_prefill_triggers() and 
-            self.generate_trigger_tokens is None):
-            return True
-            
-        # 尝试从context获取当前token和位置信息
-        try:
-            from vllm.forward_context import get_forward_context
-            if get_forward_context is None:
-                # 如果无法获取context，默认应用控制向量
-                return True
-                
-            ctx = get_forward_context()
-            if ctx is None:
-                return True
-                
-            # 检查是否在prefill或decode阶段
-            # ForwardContext对象有is_decode属性，我们用它来区分阶段
-            if not hasattr(ctx, 'is_decode') or not ctx.is_decode:
-                # prefill阶段
-                # 检查是否对所有prefill token应用
-                if self._should_apply_to_all_prefill_tokens():
-                    return True
-                    
-                # 检查token id触发器
-                if (self.prefill_trigger_tokens is not None and 
-                    hasattr(ctx, 'token_id') and
-                    ctx.token_id in self.prefill_trigger_tokens):
-                    return True
-                    
-                # 检查位置触发器
-                if self.prefill_trigger_positions is not None:
-                    # 获取seq_len和当前位置
-                    if not hasattr(ctx, 'seq_start_loc'):
-                        # 没有位置信息，保险起见应用控制向量
-                        return True
-                    
-                    if not hasattr(ctx, 'position'):
-                        return True
-                        
-                    # 解析相对位置为绝对位置
-                    pos = ctx.position
-                    trigger_positions = self._resolve_positions_per_sample(
-                        self.prefill_trigger_positions, ctx.seq_start_loc)
-                        
-                    if pos in trigger_positions:
-                        return True
-                return False
-            else:
-                # decode/generate阶段
-                # 检查是否对所有generate token应用
-                if self._should_apply_to_all_generate_tokens():
-                    return True
-                    
-                # 检查token id触发器
-                if (self.generate_trigger_tokens is not None and 
-                    hasattr(ctx, 'token_id') and
-                    ctx.token_id in self.generate_trigger_tokens):
-                    return True
-                    
-                return False
-        except Exception as e:
-            # 出现异常时保险起见应用控制向量
-            if self.debug:
-                logger.warning(f"Error in _should_apply_steer_vector: {e}")
-            return True
-
-    def forward_decoder_layer(self, output):
-        """应用LM-Steer变换到隐藏状态"""
-        # 没有激活的向量，直接返回原始输出
-        if self.active_tensor_index is None:
-            return output
-
-        # 从DecoderLayer输出中提取hidden_states
-        from vllm.steer_vectors.layers import _extract_hidden_states_and_residual, _reconstruct_output
-        hidden_states, residual, other_outputs, original_format = _extract_hidden_states_and_residual(output)
-
-        # 应用干预
-        transformed = self.apply_intervention(hidden_states)
-        
-        # 如果没有变化，直接返回原始输出
-        if transformed is hidden_states:
-            return output
-            
-        # 重构并返回修改后的输出
-        return _reconstruct_output(transformed, residual, other_outputs, original_format, output)
-        
-    def forward_mlp_layer(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MLP层的forward处理，简单转发到apply_intervention"""
-        return self.apply_intervention(hidden_states)
+        # 添加原始隐藏状态：h = h + α*((h·P1)·P2^T)
+        return hidden_state + alpha * transformed
 
     @classmethod
     def load_from_path(cls, file_path: str, device: str, config=None, target_layers=None):
