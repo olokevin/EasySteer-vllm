@@ -105,6 +105,10 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
             algo.set_prefill_trigger_tokens(kwargs["prefill_trigger_tokens"])
         if "prefill_trigger_positions" in kwargs:
             algo.set_prefill_trigger_positions(kwargs["prefill_trigger_positions"])
+        if "prefill_exclude_tokens" in kwargs:
+            algo.set_prefill_exclude_tokens(kwargs["prefill_exclude_tokens"])
+        if "prefill_exclude_positions" in kwargs:
+            algo.set_prefill_exclude_positions(kwargs["prefill_exclude_positions"])
         if "generate_trigger_tokens" in kwargs:
             algo.set_generate_trigger_tokens(kwargs["generate_trigger_tokens"])
         if "debug" in kwargs:
@@ -175,6 +179,31 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
                                 if token_id.item() in algo.prefill_trigger_tokens:
                                     abs_pos = start_pos + rel_pos
                                     positions_for_this_vector.append(abs_pos)
+
+            # 处理 exclude tokens (优先级高于 include)
+            if algo.prefill_exclude_tokens is not None and positions_for_this_vector:
+                if current_tokens is not None and current_tokens.numel() > 0 and current_tokens.dim() == 1:
+                    # 过滤掉需要 exclude 的位置
+                    filtered_positions = []
+                    for pos in positions_for_this_vector:
+                        if pos < current_tokens.shape[0]:
+                            token_id = current_tokens[pos].item()
+                            if token_id not in algo.prefill_exclude_tokens:
+                                filtered_positions.append(pos)
+                        else:
+                            filtered_positions.append(pos)
+                    positions_for_this_vector = filtered_positions
+
+            # 处理 exclude positions (优先级高于 include)
+            if algo.prefill_exclude_positions is not None and positions_for_this_vector:
+                # 解析要排除的位置（支持负数索引）
+                if seq_start_loc is not None:
+                    excluded_positions_set = set(algo._resolve_positions_per_sample(algo.prefill_exclude_positions, seq_start_loc))
+                else:
+                    excluded_positions_set = set(algo._resolve_positions(algo.prefill_exclude_positions, total_tokens))
+                
+                # 过滤掉要排除的位置
+                positions_for_this_vector = [pos for pos in positions_for_this_vector if pos not in excluded_positions_set]
 
             # 去重并添加到position_to_vectors映射
             for pos in set(positions_for_this_vector):
@@ -379,7 +408,7 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
             self._apply_vectorized(hidden_states, resolved_mapping, "sample")
         else:
             # Prefill phase
-            # Fast path: 所有向量均对全部 token 生效（prefill_trigger_tokens == {-1} 且无位置触发）
+            # Fast path: 所有向量均对全部 token 生效（prefill_trigger_tokens == {-1} 且无位置触发且无exclude）
             global_only_vectors: List[Tuple[int, AlgorithmTemplate]] = []
             mixed_case = False
             for vid, algo in self.vector_algorithms.items():
@@ -389,7 +418,9 @@ class MultiVectorAlgorithm(AlgorithmTemplate):
                     algo.prefill_trigger_tokens is not None and
                     (-1 in algo.prefill_trigger_tokens) and
                     len(algo.prefill_trigger_tokens) == 1 and
-                    algo.prefill_trigger_positions is None
+                    algo.prefill_trigger_positions is None and
+                    algo.prefill_exclude_tokens is None and  # 如果有exclude tokens，不能走全局路径
+                    algo.prefill_exclude_positions is None  # 如果有exclude positions，不能走全局路径
                 )
                 if is_global_only:
                     global_only_vectors.append((vid, algo))

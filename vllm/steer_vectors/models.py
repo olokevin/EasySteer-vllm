@@ -200,6 +200,8 @@ class SteerVectorModel(AdapterModel):
                         'target_layers': vector_config.target_layers,
                         'prefill_trigger_tokens': vector_config.prefill_trigger_tokens,
                         'prefill_trigger_positions': vector_config.prefill_trigger_positions,
+                        'prefill_exclude_tokens': vector_config.prefill_exclude_tokens,
+                        'prefill_exclude_positions': vector_config.prefill_exclude_positions,
                         'generate_trigger_tokens': vector_config.generate_trigger_tokens,
                         'algorithm': vector_config.algorithm,
                         'path': vector_config.path,
@@ -253,6 +255,8 @@ class SteerVectorModelManager(AdapterModelManager):
             target_layers: Optional[list[int]] = None,
             prefill_trigger_tokens: Optional[list[int]] = None,
             prefill_trigger_positions: Optional[list[int]] = None,
+            prefill_exclude_tokens: Optional[list[int]] = None,
+            prefill_exclude_positions: Optional[list[int]] = None,
             generate_trigger_tokens: Optional[list[int]] = None,
             debug: bool = False,
             conflict_resolution: str = "priority",
@@ -280,6 +284,8 @@ class SteerVectorModelManager(AdapterModelManager):
             "scale_factor": steer_vector_model.scale_factor,
             "prefill_trigger_tokens": prefill_trigger_tokens,
             "prefill_trigger_positions": prefill_trigger_positions,
+            "prefill_exclude_tokens": prefill_exclude_tokens,
+            "prefill_exclude_positions": prefill_exclude_positions,
             "generate_trigger_tokens": generate_trigger_tokens,
             "debug": debug,
             "normalize": normalize,
@@ -377,6 +383,8 @@ class SteerVectorModelManager(AdapterModelManager):
             "scale_factor": vector_data.get('scale', 1.0), # 传递缩放因子
             "prefill_trigger_tokens": vector_data.get('prefill_trigger_tokens'),
             "prefill_trigger_positions": vector_data.get('prefill_trigger_positions'),
+            "prefill_exclude_tokens": vector_data.get('prefill_exclude_tokens'),
+            "prefill_exclude_positions": vector_data.get('prefill_exclude_positions'),
             "generate_trigger_tokens": vector_data.get('generate_trigger_tokens'),
             "debug": debug,
             "normalize": vector_data.get('normalize', False),  # Add normalize parameter
@@ -518,6 +526,8 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
             target_layers: Optional[list[int]] = None,
             prefill_trigger_tokens: Optional[list[int]] = None,
             prefill_trigger_positions: Optional[list[int]] = None,
+            prefill_exclude_tokens: Optional[list[int]] = None,
+            prefill_exclude_positions: Optional[list[int]] = None,
             generate_trigger_tokens: Optional[list[int]] = None,
             debug: bool = False,
             conflict_resolution: str = "priority",
@@ -531,6 +541,8 @@ class LRUCacheSteerVectorModelManager(SteerVectorModelManager):
         super().activate_adapter(steer_vector_id, target_layers,
                                           prefill_trigger_tokens,
                                           prefill_trigger_positions,
+                                          prefill_exclude_tokens,
+                                          prefill_exclude_positions,
                                           generate_trigger_tokens, debug,
                                           conflict_resolution, normalize)
         

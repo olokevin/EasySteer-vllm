@@ -17,6 +17,10 @@ class VectorConfig:
                                Use [-1] to apply to ALL tokens in prefill phase.
         prefill_trigger_positions: List of token positions that trigger vector application in prefill phase.
                                  Supports negative indexing (e.g., -1 for last token).
+        prefill_exclude_tokens: List of token IDs to exclude from vector application in prefill phase.
+                               Exclude has higher priority than trigger tokens.
+        prefill_exclude_positions: List of token positions to exclude from vector application in prefill phase.
+                                  Supports negative indexing. Exclude has higher priority than trigger positions.
         generate_trigger_tokens: List of token IDs that trigger vector application in generate phase.
                                 Use [-1] to apply to ALL tokens in generate phase.
         algorithm: Vector algorithm to use: 'direct' (default) or 'loreft'
@@ -27,6 +31,8 @@ class VectorConfig:
     target_layers: Optional[List[int]] = None
     prefill_trigger_tokens: Optional[List[int]] = None
     prefill_trigger_positions: Optional[List[int]] = None
+    prefill_exclude_tokens: Optional[List[int]] = None
+    prefill_exclude_positions: Optional[List[int]] = None
     generate_trigger_tokens: Optional[List[int]] = None
     algorithm: str = "direct"
     normalize: bool = False
@@ -53,6 +59,8 @@ class SteerVectorRequest(AdapterRequest):
         target_layers: List of layer indices to apply the steer vector to. If None, apply to all layers
         prefill_trigger_tokens: List of token IDs that trigger steer vector application in prefill phase.
         prefill_trigger_positions: List of token positions that trigger steer vector application in prefill phase.
+        prefill_exclude_tokens: List of token IDs to exclude from steer vector application in prefill phase.
+        prefill_exclude_positions: List of token positions to exclude from steer vector application in prefill phase.
         generate_trigger_tokens: List of token IDs that trigger steer vector application in generate phase.
         algorithm: Steer vector algorithm to use: 'direct' (default) or 'loreft'
         normalize: Whether to normalize the steer vector (default: False, only applies to 'direct' algorithm)
@@ -72,6 +80,8 @@ class SteerVectorRequest(AdapterRequest):
     target_layers: Optional[List[int]] = None
     prefill_trigger_tokens: Optional[List[int]] = None
     prefill_trigger_positions: Optional[List[int]] = None
+    prefill_exclude_tokens: Optional[List[int]] = None
+    prefill_exclude_positions: Optional[List[int]] = None
     generate_trigger_tokens: Optional[List[int]] = None
     algorithm: str = "direct"
     normalize: bool = False

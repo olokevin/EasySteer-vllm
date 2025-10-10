@@ -152,6 +152,10 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
             algo.set_prefill_trigger_tokens(kwargs["prefill_trigger_tokens"])
         if "prefill_trigger_positions" in kwargs:
             algo.set_prefill_trigger_positions(kwargs["prefill_trigger_positions"])
+        if "prefill_exclude_tokens" in kwargs:
+            algo.set_prefill_exclude_tokens(kwargs["prefill_exclude_tokens"])
+        if "prefill_exclude_positions" in kwargs:
+            algo.set_prefill_exclude_positions(kwargs["prefill_exclude_positions"])
         if "generate_trigger_tokens" in kwargs:
             algo.set_generate_trigger_tokens(kwargs["generate_trigger_tokens"])
         if "debug" in kwargs:
@@ -181,6 +185,12 @@ class DecoderLayerWithSteerVector(BaseLayerWithSteerVector):
 
     def set_prefill_trigger_positions(self, positions: Optional[list[int]]):
         self._apply_to_active_algorithm("set_prefill_trigger_positions", positions)
+
+    def set_prefill_exclude_tokens(self, token_ids: Optional[list[int]]):
+        self._apply_to_active_algorithm("set_prefill_exclude_tokens", token_ids)
+
+    def set_prefill_exclude_positions(self, positions: Optional[list[int]]):
+        self._apply_to_active_algorithm("set_prefill_exclude_positions", positions)
 
     def set_generate_trigger_tokens(self, token_ids: Optional[list[int]]):
         self._apply_to_active_algorithm("set_generate_trigger_tokens", token_ids)

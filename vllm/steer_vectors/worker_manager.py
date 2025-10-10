@@ -104,6 +104,8 @@ class WorkerSteerVectorManager(AbstractWorkerManager):
                 target_layers=adapter_request.target_layers,
                 prefill_trigger_tokens=adapter_request.prefill_trigger_tokens,
                 prefill_trigger_positions=adapter_request.prefill_trigger_positions,
+                prefill_exclude_tokens=adapter_request.prefill_exclude_tokens,
+                prefill_exclude_positions=adapter_request.prefill_exclude_positions,
                 generate_trigger_tokens=adapter_request.generate_trigger_tokens,
                 debug=adapter_request.debug,
                 normalize=adapter_request.normalize)
@@ -196,6 +198,8 @@ class LRUCacheWorkerSteerVectorManager(WorkerSteerVectorManager):
                 target_layers=steer_vector_request.target_layers,
                 prefill_trigger_tokens=steer_vector_request.prefill_trigger_tokens,
                 prefill_trigger_positions=steer_vector_request.prefill_trigger_positions,
+                prefill_exclude_tokens=steer_vector_request.prefill_exclude_tokens,
+                prefill_exclude_positions=steer_vector_request.prefill_exclude_positions,
                 generate_trigger_tokens=steer_vector_request.generate_trigger_tokens,
                 debug=steer_vector_request.debug,
                 normalize=steer_vector_request.normalize)

@@ -12,6 +12,8 @@ class BaseSteerVectorAlgorithm(ABC):
         self.debug = False
         self.prefill_trigger_tokens: Optional[set[int]] = None
         self.prefill_trigger_positions: Optional[list[int]] = None
+        self.prefill_exclude_tokens: Optional[set[int]] = None
+        self.prefill_exclude_positions: Optional[list[int]] = None
         self.generate_trigger_tokens: Optional[set[int]] = None
 
     def set_debug(self, debug: bool) -> None:
@@ -25,6 +27,14 @@ class BaseSteerVectorAlgorithm(ABC):
     def set_prefill_trigger_positions(self, positions: Optional[list[int]]) -> None:
         """设置prefill阶段的触发位置"""
         self.prefill_trigger_positions = positions
+
+    def set_prefill_exclude_tokens(self, token_ids: Optional[list[int]]) -> None:
+        """设置prefill阶段需要排除的token"""
+        self.prefill_exclude_tokens = set(token_ids) if token_ids is not None else None
+
+    def set_prefill_exclude_positions(self, positions: Optional[list[int]]) -> None:
+        """设置prefill阶段需要排除的位置"""
+        self.prefill_exclude_positions = positions
 
     def set_generate_trigger_tokens(self, token_ids: Optional[list[int]]) -> None:
         """设置generate阶段的触发token"""

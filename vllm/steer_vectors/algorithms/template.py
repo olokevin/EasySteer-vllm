@@ -128,11 +128,73 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
         total_tokens = hidden_states.shape[0]
 
         if self._should_apply_to_all_prefill_tokens():
-            if self.debug:
-                print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
-                      f"Applying transformation to ALL {total_tokens} tokens in prefill phase")
-            original_dtype = hidden_states.dtype
-            hidden_states = self._transform(hidden_states, params).to(original_dtype)
+            # 如果有 exclude tokens 或 exclude positions，需要特殊处理
+            if self.prefill_exclude_tokens is not None or self.prefill_exclude_positions is not None:
+                # 收集所有位置，然后应用 exclude 逻辑
+                positions_to_apply = list(range(total_tokens))
+                
+                # 先过滤掉需要 exclude 的 token
+                if self.prefill_exclude_tokens is not None and current_tokens.numel() > 0 and current_tokens.dim() == 1:
+                    filtered_positions = []
+                    excluded_positions = []
+                    for pos in positions_to_apply:
+                        if pos < current_tokens.shape[0]:
+                            token_id = current_tokens[pos].item()
+                            if token_id in self.prefill_exclude_tokens:
+                                excluded_positions.append(pos)
+                            else:
+                                filtered_positions.append(pos)
+                        else:
+                            filtered_positions.append(pos)
+                    
+                    positions_to_apply = filtered_positions
+                    
+                    if self.debug and excluded_positions:
+                        excluded_token_ids = [current_tokens[pos].item() for pos in excluded_positions if pos < current_tokens.shape[0]]
+                        print(f"[{self.__class__.__name__}] Excluded {len(excluded_positions)} positions from ALL tokens due to exclude tokens: "
+                              f"token_ids {excluded_token_ids}")
+                
+                # 再过滤掉需要 exclude 的位置
+                if self.prefill_exclude_positions is not None and positions_to_apply:
+                    # 获取 seq_start_loc 以支持相对位置
+                    seq_start_loc = None
+                    if hasattr(attn_metadata, 'seq_start_loc') and attn_metadata.seq_start_loc is not None:
+                        seq_start_loc = attn_metadata.seq_start_loc
+                    elif hasattr(attn_metadata, 'prefill_metadata') and attn_metadata.prefill_metadata is not None:
+                        prefill_meta = attn_metadata.prefill_metadata
+                        if hasattr(prefill_meta, 'seq_start_loc'):
+                            seq_start_loc = prefill_meta.seq_start_loc
+                    
+                    # 解析要排除的位置
+                    if seq_start_loc is not None:
+                        excluded_positions_set = set(self._resolve_positions_per_sample(self.prefill_exclude_positions, seq_start_loc))
+                    else:
+                        excluded_positions_set = set(self._resolve_positions(self.prefill_exclude_positions, total_tokens))
+                    
+                    positions_before = len(positions_to_apply)
+                    positions_to_apply = [pos for pos in positions_to_apply if pos not in excluded_positions_set]
+                    
+                    if self.debug and excluded_positions_set:
+                        actually_excluded = excluded_positions_set.intersection(set(range(total_tokens)))
+                        if actually_excluded:
+                            print(f"[{self.__class__.__name__}] Excluded {len(actually_excluded)} positions from ALL tokens due to exclude positions: "
+                                  f"{sorted(actually_excluded)}")
+                
+                if positions_to_apply:
+                    if self.debug:
+                        print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
+                              f"Applying transformation to {len(positions_to_apply)} tokens (after exclude)")
+                    positions_tensor = torch.tensor(positions_to_apply, device=hidden_states.device, dtype=torch.long)
+                    selected_states = hidden_states.index_select(0, positions_tensor)
+                    transformed_states = self._transform(selected_states, params).to(selected_states.dtype)
+                    hidden_states.index_copy_(0, positions_tensor, transformed_states)
+            else:
+                # 没有 exclude，直接应用到所有 token
+                if self.debug:
+                    print(f"[{self.__class__.__name__}] Layer {self.layer_id}: "
+                          f"Applying transformation to ALL {total_tokens} tokens in prefill phase")
+                original_dtype = hidden_states.dtype
+                hidden_states = self._transform(hidden_states, params).to(original_dtype)
         else:
             # 收集所有需要应用变换的位置
             positions_to_apply = []
@@ -191,6 +253,59 @@ class AlgorithmTemplate(BaseSteerVectorAlgorithm, ABC):
 
             # 去重并排序
             positions_to_apply = sorted(set(positions_to_apply))
+
+            # 处理 exclude tokens (优先级高于 include)
+            if self.prefill_exclude_tokens is not None and positions_to_apply and current_tokens.numel() > 0:
+                if current_tokens.dim() == 1:
+                    positions_before_exclude = len(positions_to_apply)
+                    excluded_positions = []
+                    
+                    # 过滤掉需要 exclude 的位置
+                    filtered_positions = []
+                    for pos in positions_to_apply:
+                        if pos < current_tokens.shape[0]:
+                            token_id = current_tokens[pos].item()
+                            if token_id in self.prefill_exclude_tokens:
+                                excluded_positions.append(pos)
+                            else:
+                                filtered_positions.append(pos)
+                        else:
+                            filtered_positions.append(pos)
+                    
+                    positions_to_apply = filtered_positions
+                    
+                    if self.debug and excluded_positions:
+                        excluded_token_ids = [current_tokens[pos].item() for pos in excluded_positions if pos < current_tokens.shape[0]]
+                        print(f"[{self.__class__.__name__}] Excluded {len(excluded_positions)} positions due to exclude tokens: "
+                              f"positions {excluded_positions}, token_ids {excluded_token_ids}")
+                        print(f"[{self.__class__.__name__}] Positions reduced from {positions_before_exclude} to {len(positions_to_apply)}")
+
+            # 处理 exclude positions (优先级高于 include)
+            if self.prefill_exclude_positions is not None and positions_to_apply:
+                # 获取 seq_start_loc 以支持每个样本的相对位置解析
+                seq_start_loc = None
+                if hasattr(attn_metadata, 'seq_start_loc') and attn_metadata.seq_start_loc is not None:
+                    seq_start_loc = attn_metadata.seq_start_loc
+                elif hasattr(attn_metadata, 'prefill_metadata') and attn_metadata.prefill_metadata is not None:
+                    prefill_meta = attn_metadata.prefill_metadata
+                    if hasattr(prefill_meta, 'seq_start_loc'):
+                        seq_start_loc = prefill_meta.seq_start_loc
+                
+                # 解析要排除的位置（支持负数索引）
+                if seq_start_loc is not None:
+                    excluded_positions_set = set(self._resolve_positions_per_sample(self.prefill_exclude_positions, seq_start_loc))
+                else:
+                    excluded_positions_set = set(self._resolve_positions(self.prefill_exclude_positions, total_tokens))
+                
+                positions_before_exclude = len(positions_to_apply)
+                positions_to_apply = [pos for pos in positions_to_apply if pos not in excluded_positions_set]
+                
+                if self.debug and excluded_positions_set:
+                    actually_excluded = excluded_positions_set.intersection(set(range(positions_before_exclude)))
+                    if actually_excluded:
+                        print(f"[{self.__class__.__name__}] Excluded {len(actually_excluded)} positions due to exclude positions: "
+                              f"{sorted(actually_excluded)}")
+                        print(f"[{self.__class__.__name__}] Positions reduced from {positions_before_exclude} to {len(positions_to_apply)}")
 
             if positions_to_apply:
                 if self.debug:
