@@ -38,6 +38,7 @@ class CachedRequestState:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     output_token_ids: list[int]
+    num_dropped_tokens: int = 0
 
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[int] = None
@@ -70,7 +71,6 @@ class InputBatch:
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
         is_spec_decode: bool = False,
-        logits_processing_needs_token_ids: bool = False,
     ):
         self.is_spec_decode = is_spec_decode
         self.max_num_reqs = max_num_reqs
@@ -79,8 +79,6 @@ class InputBatch:
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
-        self.logits_processing_needs_token_ids = (
-            logits_processing_needs_token_ids)
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -107,6 +105,14 @@ class InputBatch:
         )
         self.num_computed_tokens_cpu = \
             self.num_computed_tokens_cpu_tensor.numpy()
+        self.num_dropped_tokens_list_cpu_tensor = torch.zeros(
+             (max_num_reqs, ),
+             device="cpu",
+             dtype=torch.int32,
+             pin_memory=pin_memory,
+         )
+        self.num_dropped_tokens_list_cpu = \
+            self.num_dropped_tokens_list_cpu_tensor.numpy()
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -233,6 +239,9 @@ class InputBatch:
         # req_index -> bad_words_token_ids
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
+        self.logits_processing_needs_token_ids = np.zeros(max_num_reqs,
+                                                          dtype=bool)
+
         self.req_output_token_ids: list[Optional[list[int]]] = []
 
         # This is updated each time the batch constituents change.
@@ -295,6 +304,7 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.num_dropped_tokens_list_cpu[req_index] = request.num_dropped_tokens
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -337,7 +347,9 @@ class InputBatch:
                 self.generators[req_index] = request.generator
 
             if sampling_params.logprobs is not None:
-                self.num_logprobs[req_id] = sampling_params.logprobs
+                self.num_logprobs[req_id] = (self.vocab_size
+                                             if sampling_params.logprobs == -1
+                                             else sampling_params.logprobs)
             if sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[
                     req_id] = sampling_params.prompt_logprobs
@@ -365,9 +377,12 @@ class InputBatch:
             if sampling_params.bad_words_token_ids:
                 self.bad_words_token_ids[
                     req_index] = sampling_params.bad_words_token_ids
+        elif pooling_params := request.pooling_params:
+            self.pooling_params[req_id] = pooling_params
+            self.logits_processing_needs_token_ids[req_index] = (
+                pooling_params.requires_token_ids)
         else:
-            assert request.pooling_params is not None
-            self.pooling_params[req_id] = request.pooling_params
+            raise NotImplementedError(request)
 
         # Add request lora ID
         if request.lora_request:
@@ -386,7 +401,7 @@ class InputBatch:
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense().
-        
+
         Args:
           req_id: request to remove
 
@@ -429,6 +444,7 @@ class InputBatch:
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
         self.pooling_params.pop(req_id, None)
+        self.num_dropped_tokens_list_cpu[req_index] = 0
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -451,6 +467,8 @@ class InputBatch:
             self.num_prompt_tokens[i2], self.num_prompt_tokens[i1]
         self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] =\
             self.num_computed_tokens_cpu[i2], self.num_computed_tokens_cpu[i1]
+        self.num_dropped_tokens_list_cpu[i1], self.num_dropped_tokens_list_cpu[i2] =\
+            self.num_dropped_tokens_list_cpu[i2], self.num_dropped_tokens_list_cpu[i1]
         self.temperature_cpu[i1], self.temperature_cpu[i2] =\
             self.temperature_cpu[i2], self.temperature_cpu[i1]
         self.top_p_cpu[i1], self.top_p_cpu[i2] =\
@@ -587,7 +605,7 @@ class InputBatch:
 
     def refresh_metadata(self):
         """Apply batch updates, reset input batch at end of step
-        
+
         * Apply batch add/remove/permute to logits procs' states
         * If batch state is modified, update sampling metadata
         """
@@ -620,9 +638,9 @@ class InputBatch:
             copy_slice(self.repetition_penalties_cpu_tensor,
                        self.repetition_penalties, num_reqs)
 
-        needs_prompt_token_ids = (not self.no_penalties or
-                                  (self.num_reqs > 0
-                                   and self.logits_processing_needs_token_ids))
+        needs_prompt_token_ids = (
+            not self.no_penalties
+            or self.logits_processing_needs_token_ids[:num_reqs].any())
         if needs_prompt_token_ids:
             # The prompt tokens are used only for applying penalties or
             # step pooling during the sampling/pooling process.

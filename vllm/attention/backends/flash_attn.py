@@ -4,9 +4,11 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 import torch
+
+from rkv.compression import R1KV, R2KV_SLOW
 
 from vllm import _custom_ops as ops
 # yapf conflicts with isort for this block
@@ -25,6 +27,8 @@ from vllm.attention.backends.utils import (
     is_all_encoder_attn_metadata_set, is_block_tables_empty)
 from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version)
+from vllm.envs import (VLLM_RKV_METHOD, VLLM_RKV_METHOD_CONFIG,
+                       VLLM_V1_R_KV_BUDGET, VLLM_V1_R_KV_BUFFER)
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
@@ -133,6 +137,7 @@ class FlashAttentionMetadata(AttentionMetadata):
     # (batch_size,) A tensor of context lengths (tokens that are computed
     # so far).
     context_lens_tensor: Optional[torch.Tensor]
+    context_lens: Optional[List[int]] = None
 
     # (batch_size, max_blocks_per_seq).
     # Block addresses per sequence. (Seq id -> list of physical block)
@@ -140,13 +145,13 @@ class FlashAttentionMetadata(AttentionMetadata):
     # in the kv cache. Each block can contain up to block_size tokens.
     # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
     # captured.
-    block_tables: Optional[torch.Tensor]
+    block_tables: Optional[torch.Tensor] = None
 
     # Whether or not if cuda graph is enabled.
     # Cuda-graph is currently enabled for decoding only.
     # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
 
-    use_cuda_graph: bool
+    use_cuda_graph: bool = False
 
     # Maximum query length in the batch.
     max_query_len: Optional[int] = None
@@ -184,6 +189,9 @@ class FlashAttentionMetadata(AttentionMetadata):
     # and block tables
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
+    occupied_slot_mapping: Optional[torch.Tensor] = None
+    total_num_kv_cache_tokens: int = 0
+    num_dropped_tokens_list: Optional[list[int]] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -229,6 +237,18 @@ class FlashAttentionMetadata(AttentionMetadata):
                                self.context_lens_tensor[:self.num_prefills])
         block_tables = (None if self.block_tables is None else
                         self.block_tables[:self.num_prefills])
+        if self.context_lens is not None:
+            context_lens_list = self.context_lens[:self.num_prefills]
+        elif context_lens_tensor is not None:
+            context_lens_list = context_lens_tensor.cpu().tolist()
+        else:
+            context_lens_list = []
+        prefill_context_tokens = sum(context_lens_list)
+        occupied_slot_mapping = (None if self.occupied_slot_mapping is None
+                                 else self.occupied_slot_mapping[
+                                     :prefill_context_tokens])
+        num_dropped_tokens_list = ([0] * self.num_prefills
+                                   if self.num_prefills > 0 else None)
 
         self._cached_prefill_metadata = FlashAttentionMetadata(
             num_prefills=self.num_prefills,
@@ -239,6 +259,7 @@ class FlashAttentionMetadata(AttentionMetadata):
             multi_modal_placeholder_index_maps,
             enable_kv_scales_calculation=self.enable_kv_scales_calculation,
             seq_lens=seq_lens,
+            context_lens=context_lens_list if context_lens_list else None,
             seq_lens_tensor=seq_lens_tensor,
             max_query_len=self.max_query_len,
             max_prefill_seq_len=self.max_prefill_seq_len,
@@ -249,6 +270,9 @@ class FlashAttentionMetadata(AttentionMetadata):
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=False,
+            occupied_slot_mapping=occupied_slot_mapping,
+            total_num_kv_cache_tokens=prefill_context_tokens,
+            num_dropped_tokens_list=num_dropped_tokens_list,
             # Begin encoder & cross attn fields below...
             encoder_seq_lens=self.encoder_seq_lens,
             encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
@@ -275,6 +299,28 @@ class FlashAttentionMetadata(AttentionMetadata):
                            self.seq_lens_tensor[self.num_prefills:])
         block_tables = (None if self.block_tables is None else
                         self.block_tables[self.num_prefills:])
+        context_lens_tensor = (None if self.context_lens_tensor is None else
+                               self.context_lens_tensor[self.num_prefills:])
+        if self.context_lens is not None:
+            context_lens_list = self.context_lens[self.num_prefills:
+                                                  self.num_prefills +
+                                                  self.num_decode_tokens]
+            prefill_context_tokens = sum(self.context_lens[:self.num_prefills])
+        elif context_lens_tensor is not None:
+            context_lens_list = context_lens_tensor.cpu().tolist()
+            prefill_context_tokens = int(
+                self.context_lens_tensor[:self.num_prefills].sum().item())
+        else:
+            context_lens_list = []
+            prefill_context_tokens = 0
+        decode_context_tokens = sum(context_lens_list)
+        occupied_slot_mapping = (None if self.occupied_slot_mapping is None
+                                 else self.occupied_slot_mapping[
+                                     prefill_context_tokens:
+                                     prefill_context_tokens +
+                                     decode_context_tokens])
+        num_dropped_tokens_list = ([0] * self.num_decode_tokens
+                                   if self.num_decode_tokens > 0 else None)
 
         self._cached_decode_metadata = FlashAttentionMetadata(
             num_prefills=0,
@@ -284,6 +330,7 @@ class FlashAttentionMetadata(AttentionMetadata):
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=True,
             seq_lens=None,
+            context_lens=context_lens_list if context_lens_list else None,
             seq_lens_tensor=seq_lens_tensor,
             max_decode_query_len=self.max_decode_query_len,
             max_query_len=self.max_query_len,
@@ -297,9 +344,12 @@ class FlashAttentionMetadata(AttentionMetadata):
             if self.query_start_loc is not None else None,
             seq_start_loc=self.seq_start_loc[self.num_prefills:]
             if self.seq_start_loc is not None else None,
-            context_lens_tensor=None,
+            context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=self.use_cuda_graph,
+            occupied_slot_mapping=occupied_slot_mapping,
+            total_num_kv_cache_tokens=decode_context_tokens,
+            num_dropped_tokens_list=num_dropped_tokens_list,
             # Begin encoder & cross attn fields below...
             encoder_seq_lens=self.encoder_seq_lens,
             encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
@@ -396,6 +446,7 @@ class FlashAttentionMetadataBuilder(
         self.slot_mapping: List[int] = []
         self.prefill_seq_lens: List[int] = []
         self.context_lens: List[int] = []
+        self.occupied_slot_mapping: List[int] = []
         self.block_tables: List[List[int]] = []
         self.curr_seq_lens: List[int] = []
         self.multimodal_placeholder_maps: Dict[
@@ -424,6 +475,17 @@ class FlashAttentionMetadataBuilder(
                  inter_data.query_lens, inter_data.context_lens,
                  inter_data.curr_sliding_window_blocks):
             self.context_lens.append(context_len)
+            ctx_slot_mapping: List[int] = []
+            compute_slot_mapping(
+                is_block_tables_empty(block_tables),
+                ctx_slot_mapping,
+                seq_id,
+                context_len,
+                context_len,
+                0,
+                self.block_size,
+                inter_data.block_tables)
+            self.occupied_slot_mapping.extend(ctx_slot_mapping)
 
             if is_prompt:
                 mm_maps = inter_data.multi_modal_placeholder_maps
@@ -548,6 +610,12 @@ class FlashAttentionMetadataBuilder(
                                            self.runner.pin_memory)
         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
                                                device, self.runner.pin_memory)
+        occupied_slot_mapping_tensor = async_tensor_h2d(
+            self.occupied_slot_mapping,
+            torch.long,
+            device,
+            self.runner.pin_memory)
+        total_kv_cache_tokens = sum(self.context_lens)
         query_start_loc_tensor = async_tensor_h2d(query_start_loc, torch.int32,
                                                   device,
                                                   self.runner.pin_memory)
@@ -565,6 +633,7 @@ class FlashAttentionMetadataBuilder(
             num_prefill_tokens=self.num_prefill_tokens,
             num_decode_tokens=num_decode_tokens,
             seq_lens=seq_lens,
+            context_lens=self.context_lens,
             multi_modal_placeholder_index_maps=placeholder_index_maps,
             enable_kv_scales_calculation=True,
             seq_lens_tensor=seq_lens_tensor,
@@ -577,6 +646,8 @@ class FlashAttentionMetadataBuilder(
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
+            occupied_slot_mapping=occupied_slot_mapping_tensor,
+            total_num_kv_cache_tokens=total_kv_cache_tokens,
         )
 
 
@@ -615,17 +686,17 @@ class FlashAttentionImpl(AttentionImpl):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
     ) -> None:
         if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in V0.")
-        if blocksparse_params is not None:
-            raise ValueError(
-                "FlashAttention does not support block-sparse attention.")
+            logger.warning(
+                "KV sharing request for layer '%s' is not supported in the V0 "
+                "FlashAttention backend; continuing without sharing.",
+                kv_sharing_target_layer_name,
+            )
         if use_irope:
             logger.warning(
                 "Using irope in V0 is not supported yet, it will fall back "
@@ -662,6 +733,102 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
         self.attn_type = attn_type
+        self.kv_method = (VLLM_RKV_METHOD or "rkv").lower()
+        method_config_env = VLLM_RKV_METHOD_CONFIG
+        self.kv_method_config = dict(method_config_env) if isinstance(
+            method_config_env, dict) else {}
+
+        self._kvcompressor_cls = None
+        self._kvcompressor_kwargs: Dict[str, object] = {}
+        self._kvcompressor_template = None
+        self._sequence_compressors: Dict[Tuple[int, ...], object] = {}
+
+        if VLLM_V1_R_KV_BUDGET <= 0 or VLLM_V1_R_KV_BUFFER <= 0:
+            self.kvcompressor = None
+        else:
+            if self.kv_method == "rkv2_slow":
+                compressor_cls = R2KV_SLOW
+                compressor_name = "R2KV_SLOW"
+            elif self.kv_method in ("rkv", "r1kv"):
+                compressor_cls = R1KV
+                compressor_name = "R1KV"
+                self.kv_method = "rkv"
+            else:
+                logger.warning(
+                    "Unknown KV compression method '%s'; falling back to R1KV.",
+                    self.kv_method,
+                )
+                compressor_cls = R1KV
+                compressor_name = "R1KV"
+                self.kv_method = "rkv"
+
+            compressor_kwargs = dict(self.kv_method_config)
+            compressor_kwargs["budget"] = VLLM_V1_R_KV_BUDGET
+            compressor_kwargs.setdefault("window_size", 8)
+
+            self.kvcompressor = compressor_cls(**compressor_kwargs)
+            self._kvcompressor_cls = compressor_cls
+            self._kvcompressor_kwargs = compressor_kwargs
+            if self.kv_method == "rkv2_slow":
+                self._kvcompressor_template = self.kvcompressor
+                self.kvcompressor = None
+
+            print(
+                f"v0/FlashAttentionImpl: Using {compressor_name} compressor with "
+                f"v0 backend, budget={VLLM_V1_R_KV_BUDGET}, method_config={compressor_kwargs}"
+            )
+
+    def _build_kvcompressor(self):
+        if self._kvcompressor_cls is None:
+            return None
+        if self._kvcompressor_template is not None:
+            compressor = self._kvcompressor_template
+            self._kvcompressor_template = None
+        else:
+            compressor = self._kvcompressor_cls(**self._kvcompressor_kwargs)
+        if hasattr(compressor, "reset_for_new_batch"):
+            compressor.reset_for_new_batch()
+        return compressor
+
+    def _match_sequence_key(
+        self, key_tuple: Tuple[int, ...]
+    ) -> Optional[Tuple[int, ...]]:
+        if key_tuple in self._sequence_compressors:
+            return key_tuple
+        best_key: Optional[Tuple[int, ...]] = None
+        for existing_key in list(self._sequence_compressors.keys()):
+            if (len(existing_key) <= len(key_tuple)
+                    and key_tuple[:len(existing_key)] == existing_key):
+                if best_key is None or len(existing_key) > len(best_key):
+                    best_key = existing_key
+        return best_key
+
+    def _acquire_sequence_compressor(
+        self, slot_indices: torch.Tensor
+    ) -> Tuple[Optional[object], Optional[Tuple[int, ...]]]:
+        if self.kv_method != "rkv2_slow":
+            return self.kvcompressor, None
+        key_tuple = tuple(int(x) for x in slot_indices.tolist())
+        match_key = self._match_sequence_key(key_tuple)
+        if match_key is not None:
+            compressor = self._sequence_compressors.pop(match_key)
+        else:
+            compressor = self._build_kvcompressor()
+        return compressor, key_tuple
+
+    def _store_sequence_compressor(
+        self, key_tuple: Tuple[int, ...], compressor: Optional[object]
+    ) -> None:
+        if self.kv_method != "rkv2_slow":
+            return
+        if compressor is None or not key_tuple:
+            return
+        self._sequence_compressors[key_tuple] = compressor
+        if len(self._sequence_compressors) > 64:
+            # Remove an arbitrary stale entry to cap memory usage.
+            stale_key = next(iter(self._sequence_compressors))
+            if stale_key != key_tuple:
+                self._sequence_compressors.pop(stale_key, None)
 
     def forward(
         self,
@@ -704,7 +871,7 @@ class FlashAttentionImpl(AttentionImpl):
                     "key/v_scale is only supported in FlashAttention 3 with "
                     "base dtype bfloat16")
 
-        attn_type = self.attn_type
+        attn_type = self.attn_type or AttentionType.DECODER
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
             raise AttributeError("Encoder attention requires setting "
@@ -776,10 +943,11 @@ class FlashAttentionImpl(AttentionImpl):
         (num_prefill_query_tokens, num_prefill_kv_tokens,
         num_decode_query_tokens) = \
             get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
-        decode_query = query[num_prefill_query_tokens:]
+        full_query = query
+        decode_query = full_query[num_prefill_query_tokens:]
         decode_output = output[num_prefill_query_tokens:]
         # QKV for prefill.
-        query = query[:num_prefill_query_tokens]
+        query = full_query[:num_prefill_query_tokens]
         prefill_output = output[:num_prefill_query_tokens]
         assert query.shape[0] == num_prefill_query_tokens
         assert decode_query.shape[0] == num_decode_query_tokens
@@ -922,6 +1090,88 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=layer._k_scale.expand(descale_shape),
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
+            compressor_ready = (
+                (self.kv_method == "rkv2_slow"
+                 and self._kvcompressor_cls is not None)
+                or self.kvcompressor is not None
+            )
+            if (compressor_ready
+                    and VLLM_V1_R_KV_BUDGET > 0
+                    and VLLM_V1_R_KV_BUFFER > 0
+                    and decode_meta.occupied_slot_mapping is not None
+                    and decode_meta.context_lens is not None
+                    and decode_meta.num_dropped_tokens_list is not None
+                    and decode_meta.num_decode_tokens > 0):
+                context_lens_list = list(decode_meta.context_lens)
+                if len(context_lens_list) == decode_meta.num_decode_tokens:
+                    occupied_slot_mapping = decode_meta.occupied_slot_mapping
+                    key_cache_flat = key_cache.view(-1, key_cache.size(-2),
+                                                    key_cache.size(-1))
+                    value_cache_flat = value_cache.view(
+                        -1, value_cache.size(-2), value_cache.size(-1))
+                    offsets = [0]
+                    for length in context_lens_list:
+                        offsets.append(offsets[-1] + length)
+                    for i in range(decode_meta.num_decode_tokens):
+                        context_len = context_lens_list[i]
+                        if (context_len <
+                                VLLM_V1_R_KV_BUDGET + VLLM_V1_R_KV_BUFFER):
+                            continue
+                        start = offsets[i]
+                        end = offsets[i + 1]
+                        indices = occupied_slot_mapping[start:end]
+                        if indices.numel() == 0:
+                            continue
+
+                        compressor, new_key_tuple = \
+                            self._acquire_sequence_compressor(indices)
+                        if compressor is None:
+                            continue
+
+                        current_key_cache = key_cache_flat[indices, ...]
+                        current_value_cache = value_cache_flat[indices, ...]
+
+                        current_query = full_query.transpose(0, 1)
+                        current_key_cache = current_key_cache.transpose(0, 1)
+                        current_value_cache = current_value_cache.transpose(0,
+                                                                           1)
+
+                        current_query = current_query.unsqueeze(0)
+                        current_key_cache = current_key_cache.unsqueeze(0)
+                        current_value_cache = current_value_cache.unsqueeze(0)
+
+                        current_kv_len = current_key_cache.size(2)
+                        layer_idx = getattr(layer, "layer_idx",
+                                            getattr(layer, "layer_id", 0))
+                        current_pos = [int(context_len)]
+                        compressed_key_cache, compressed_value_cache = \
+                            compressor.update_kv(
+                                current_key_cache,
+                                current_query,
+                                current_value_cache,
+                                layer_idx=layer_idx,
+                                current_pos=current_pos,
+                            )
+                        compressed_key_cache = compressed_key_cache.squeeze(0)
+                        compressed_value_cache = compressed_value_cache.squeeze(0)
+
+                        compressed_kv_len = compressed_key_cache.size(1)
+                        new_key_tuple = tuple(
+                            int(x)
+                            for x in indices[:compressed_kv_len].tolist())
+                        self._store_sequence_compressor(new_key_tuple,
+                                                        compressor)
+                        key_cache_flat[indices[:compressed_kv_len], ...] = \
+                            compressed_key_cache.transpose(0, 1)
+                        value_cache_flat[indices[:compressed_kv_len], ...] = \
+                            compressed_value_cache.transpose(0, 1)
+
+                        num_dropped_tokens_i = current_kv_len - compressed_kv_len
+                        if (num_dropped_tokens_i
+                                != decode_meta.num_dropped_tokens_list[i]):
+                            assert decode_meta.num_dropped_tokens_list[i] == 0
+                            decode_meta.num_dropped_tokens_list[i] = \
+                                num_dropped_tokens_i
         return output
 
 

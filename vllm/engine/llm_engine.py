@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import copy
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -20,7 +19,6 @@ import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
-from vllm.steer_vectors.request import SteerVectorRequest # 新增
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
@@ -37,20 +35,19 @@ from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.logits_process import get_bad_words_logits_processors
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.guided_decoding import (
-    get_local_guided_decoding_logits_processor)
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
-from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
                            PoolingSequenceGroupOutput, Sequence, SequenceGroup,
                            SequenceGroupBase, SequenceGroupMetadata,
                            SequenceGroupOutput, SequenceStatus)
+from vllm.steer_vectors.request import SteerVectorRequest
 from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
                           init_tracer)
 from vllm.transformers_utils.detokenizer import Detokenizer
@@ -224,8 +221,6 @@ class LLMEngine:
         self.load_config = vllm_config.load_config
         self.decoding_config = vllm_config.decoding_config or DecodingConfig(  # noqa
         )
-        self.prompt_adapter_config = vllm_config.prompt_adapter_config  # noqa
-        self.steer_vector_config = vllm_config.steer_vector_config # 新增
         self.observability_config = vllm_config.observability_config or ObservabilityConfig(  # noqa
         )
 
@@ -240,14 +235,14 @@ class LLMEngine:
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
-        if not self.model_config.skip_tokenizer_init:
-            self.tokenizer = self._init_tokenizer()
-            self.detokenizer = Detokenizer(self.tokenizer)
-            tokenizer_group = self.get_tokenizer_group()
-        else:
+        if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
             self.detokenizer = None
             tokenizer_group = None
+        else:
+            self.tokenizer = self._init_tokenizer()
+            self.detokenizer = Detokenizer(self.tokenizer)
+            tokenizer_group = self.get_tokenizer_group()
 
         # Ensure that the function doesn't contain a reference to self,
         # to avoid engine GC issues
@@ -296,8 +291,6 @@ class LLMEngine:
                     # Feature flags
                     "enable_lora":
                     bool(self.lora_config),
-                    "enable_prompt_adapter":
-                    bool(self.prompt_adapter_config),
                     "enable_prefix_caching":
                     self.cache_config.enable_prefix_caching,
                     "enforce_eager":
@@ -544,9 +537,6 @@ class LLMEngine:
             self.lora_config.verify_with_model_config(self.model_config)
             self.lora_config.verify_with_scheduler_config(
                 self.scheduler_config)
-        if self.prompt_adapter_config:
-            self.prompt_adapter_config.verify_with_model_config(
-                self.model_config)
 
     def _add_processed_request(
         self,
@@ -555,9 +545,9 @@ class LLMEngine:
         params: Union[SamplingParams, PoolingParams],
         arrival_time: float,
         lora_request: Optional[LoRARequest],
-        prompt_adapter_request: Optional[PromptAdapterRequest],
-        steer_vector_request: Optional[SteerVectorRequest], # 新增
         trace_headers: Optional[Mapping[str, str]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,
         priority: int = 0,
     ) -> Optional[SequenceGroup]:
         """Add a processed request to the engine's request pool.
@@ -572,8 +562,6 @@ class LLMEngine:
                 arrival_time=arrival_time,
                 lora_request=lora_request,
                 trace_headers=trace_headers,
-                prompt_adapter_request=prompt_adapter_request,
-                steer_vector_request=steer_vector_request, # 新增
                 priority=priority,
             )
             return None
@@ -587,11 +575,10 @@ class LLMEngine:
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
 
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
-                       lora_request, prompt_adapter_request)
+                       lora_request)
 
         encoder_seq = (None if encoder_inputs is None else Sequence(
-            seq_id, encoder_inputs, block_size, eos_token_id, lora_request,
-            prompt_adapter_request))
+            seq_id, encoder_inputs, block_size, eos_token_id, lora_request))
 
         # Create a SequenceGroup based on SamplingParams or PoolingParams
         if isinstance(params, SamplingParams):
@@ -603,7 +590,7 @@ class LLMEngine:
                 lora_request=lora_request,
                 trace_headers=trace_headers,
                 prompt_adapter_request=prompt_adapter_request,
-                steer_vector_request=steer_vector_request,  # 新增
+                steer_vector_request=steer_vector_request,
                 encoder_seq=encoder_seq,
                 priority=priority)
         elif isinstance(params, PoolingParams):
@@ -614,7 +601,7 @@ class LLMEngine:
                 arrival_time=arrival_time,
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
-                steer_vector_request=steer_vector_request,  # 新增
+                steer_vector_request=steer_vector_request,
                 encoder_seq=encoder_seq,
                 priority=priority)
         else:
@@ -644,7 +631,7 @@ class LLMEngine:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
+        steer_vector_request: Optional[SteerVectorRequest] = None,
         priority: int = 0,
     ) -> None:
         """Add a request to the engine's request pool.
@@ -665,7 +652,6 @@ class LLMEngine:
                 the current monotonic time.
             lora_request: The LoRA request to add.
             trace_headers: OpenTelemetry trace headers.
-            prompt_adapter_request: The prompt adapter request to add.
             priority: The priority of the request.
                 Only applicable with priority scheduling.
 
@@ -707,11 +693,10 @@ class LLMEngine:
                              "Priority scheduling is not enabled.")
 
         if isinstance(params, SamplingParams) \
-            and (params.guided_decoding or params.logits_processors) \
+            and params.logits_processors \
             and self.scheduler_config.num_scheduler_steps > 1:
             raise ValueError(
-                "Guided decoding and logits processors are not supported "
-                "in multi-step decoding")
+                "Logits processors are not supported in multi-step decoding")
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -726,7 +711,6 @@ class LLMEngine:
             prompt,
             tokenization_kwargs=tokenization_kwargs,
             lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
         )
 
         self._add_processed_request(
@@ -735,9 +719,9 @@ class LLMEngine:
             params=params,
             arrival_time=arrival_time,
             lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            steer_vector_request=steer_vector_request, # 新增
             trace_headers=trace_headers,
+            prompt_adapter_request=prompt_adapter_request,
+            steer_vector_request=steer_vector_request,
             priority=priority,
         )
 
@@ -750,7 +734,7 @@ class LLMEngine:
         lora_request: Optional[LoRARequest],
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        steer_vector_request: Optional[SteerVectorRequest] = None, # 新增
+        steer_vector_request: Optional[SteerVectorRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
     ) -> SequenceGroup:
@@ -778,18 +762,17 @@ class LLMEngine:
         if self.vllm_config.speculative_config is not None:
             draft_size = \
                 self.vllm_config.speculative_config.num_speculative_tokens + 1
-        seq_group = SequenceGroup(
-            request_id=request_id,
-            seqs=[seq],
-            arrival_time=arrival_time,
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            trace_headers=trace_headers,
-            prompt_adapter_request=prompt_adapter_request,
-            steer_vector_request=steer_vector_request, # 新增
-            encoder_seq=encoder_seq,
-            priority=priority,
-            draft_size=draft_size)
+        seq_group = SequenceGroup(request_id=request_id,
+                                  seqs=[seq],
+                                  arrival_time=arrival_time,
+                                  sampling_params=sampling_params,
+                                  lora_request=lora_request,
+                                  trace_headers=trace_headers,
+                                  encoder_seq=encoder_seq,
+                                  priority=priority,
+                                  draft_size=draft_size)
+        seq_group.prompt_adapter_request = prompt_adapter_request
+        seq_group.steer_vector_request = steer_vector_request
 
         return seq_group
 
@@ -800,8 +783,8 @@ class LLMEngine:
         pooling_params: PoolingParams,
         arrival_time: float,
         lora_request: Optional[LoRARequest],
-        prompt_adapter_request: Optional[PromptAdapterRequest],
-        steer_vector_request: Optional[SteerVectorRequest], # 新增
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        steer_vector_request: Optional[SteerVectorRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
     ) -> SequenceGroup:
@@ -809,16 +792,15 @@ class LLMEngine:
         # Defensive copy of PoolingParams, which are used by the pooler
         pooling_params = pooling_params.clone()
         # Create the sequence group.
-        seq_group = SequenceGroup(
-            request_id=request_id,
-            seqs=[seq],
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            pooling_params=pooling_params,
-            prompt_adapter_request=prompt_adapter_request,
-            steer_vector_request=steer_vector_request, # 新增
-            encoder_seq=encoder_seq,
-            priority=priority)
+        seq_group = SequenceGroup(request_id=request_id,
+                                  seqs=[seq],
+                                  arrival_time=arrival_time,
+                                  lora_request=lora_request,
+                                  pooling_params=pooling_params,
+                                  encoder_seq=encoder_seq,
+                                  priority=priority)
+        seq_group.prompt_adapter_request = prompt_adapter_request
+        seq_group.steer_vector_request = steer_vector_request
         return seq_group
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
@@ -1004,6 +986,16 @@ class LLMEngine:
         else:
             outputs_by_sequence_group = outputs
 
+        drop_accumulator: dict[str, dict[int, int]] = {}
+        for sampler_output in outputs:
+            if isinstance(sampler_output, SamplerOutput):
+                dropped = sampler_output.dropped_tokens_per_request
+                if dropped:
+                    for req_id, seq_map in dropped.items():
+                        target = drop_accumulator.setdefault(req_id, {})
+                        for seq_id, drop in seq_map.items():
+                            target[seq_id] = target.get(seq_id, 0) + drop
+
         # Determine the requests we need to operate on
         if request_id:
             indices = []
@@ -1031,6 +1023,14 @@ class LLMEngine:
             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
 
             seq_group: SequenceGroup = scheduled_seq_group.seq_group
+
+            drops_for_request = drop_accumulator.get(seq_group.request_id)
+            if drops_for_request:
+                for seq_id, drop in drops_for_request.items():
+                    seq_obj = seq_group.seqs_dict.get(seq_id)
+                    if seq_obj is not None:
+                        seq_obj.increment_num_dropped_tokens(drop)
+                drop_accumulator.pop(seq_group.request_id, None)
 
             if seq_group.is_finished():
                 finished_before.append(i)
@@ -1260,7 +1260,7 @@ class LLMEngine:
         engine = LLMEngine.from_engine_args(engine_args)
         example_inputs = [(0, "What is LLM?",
         SamplingParams(temperature=0.0))]
-    
+
         # Start the engine with an event loop
         while True:
             if example_inputs:
@@ -1792,13 +1792,6 @@ class LLMEngine:
                 num_generation_tokens_from_prefill_groups)
             num_tokens_iter = (num_generation_tokens_iter +
                                num_prompt_tokens_iter)
-        # Spec decode, if enabled, emits specialized metrics from the worker in
-        # sampler output.
-        if model_output and isinstance(model_output[0], SamplerOutput) and (
-                model_output[0].spec_decode_worker_metrics is not None):
-            spec_decode_metrics = model_output[0].spec_decode_worker_metrics
-        else:
-            spec_decode_metrics = None
 
         return Stats(
             now=now,
@@ -1820,7 +1813,6 @@ class LLMEngine:
             num_tokens_iter=num_tokens_iter,
             time_to_first_tokens_iter=time_to_first_tokens_iter,
             time_per_output_tokens_iter=time_per_output_tokens_iter,
-            spec_decode_metrics=spec_decode_metrics,
             num_preemption_iter=num_preemption_iter,
 
             # Request stats
@@ -1853,23 +1845,6 @@ class LLMEngine:
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
-
-    def add_prompt_adapter(
-            self, prompt_adapter_request: PromptAdapterRequest) -> bool:
-        return self.model_executor.add_prompt_adapter(prompt_adapter_request)
-
-    def remove_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        return self.model_executor.remove_prompt_adapter(prompt_adapter_id)
-
-    def list_prompt_adapters(self) -> List[int]:
-        return self.model_executor.list_prompt_adapters()
-
-    # 新增
-    def add_steer_vector(self, cv_request: SteerVectorRequest) -> bool:
-        return self.model_executor.add_steer_vector(cv_request)
-
-    def remove_steer_vector(self, cv_id: int) -> bool:
-        return self.model_executor.remove_steer_vector(cv_id)
 
     def start_profile(self) -> None:
         self.model_executor.start_profile()
@@ -1925,8 +1900,14 @@ class LLMEngine:
                 context=trace_context,
                 start_time=arrival_time_nano_seconds) as seq_span:
             metrics = seq_group.metrics
-            ttft = metrics.first_token_time - metrics.arrival_time
-            e2e_time = metrics.finished_time - metrics.arrival_time
+
+            # Handle potential None values for cancelled/aborted requests
+            ttft = (metrics.first_token_time - metrics.arrival_time
+                    if metrics.first_token_time is not None else None)
+
+            e2e_time = (metrics.finished_time - metrics.arrival_time
+                        if metrics.finished_time is not None else None)
+
             seq_span.set_attribute(SpanAttributes.GEN_AI_RESPONSE_MODEL,
                                    self.model_config.model)
             seq_span.set_attribute(SpanAttributes.GEN_AI_REQUEST_ID,
@@ -1949,11 +1930,18 @@ class LLMEngine:
                     seq.get_output_len()
                     for seq in seq_group.get_finished_seqs()
                 ]))
-            seq_span.set_attribute(SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
-                                   metrics.time_in_queue)
-            seq_span.set_attribute(
-                SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN, ttft)
-            seq_span.set_attribute(SpanAttributes.GEN_AI_LATENCY_E2E, e2e_time)
+
+            # Only set timing attributes if the values are available
+            if metrics.time_in_queue is not None:
+                seq_span.set_attribute(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
+                    metrics.time_in_queue)
+            if ttft is not None:
+                seq_span.set_attribute(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN, ttft)
+            if e2e_time is not None:
+                seq_span.set_attribute(SpanAttributes.GEN_AI_LATENCY_E2E,
+                                       e2e_time)
             if metrics.scheduler_time is not None:
                 seq_span.set_attribute(
                     SpanAttributes.GEN_AI_LATENCY_TIME_IN_SCHEDULER,
@@ -2042,42 +2030,12 @@ class LLMEngine:
     def _build_logits_processors(
             self, sampling_params: SamplingParams,
             lora_request: Optional[LoRARequest]) -> SamplingParams:
-        """Constructs logits processors based on the guided_decoding,
-        logits_bias, and allowed_token_ids fields in sampling_params. Deletes
-        those fields and adds the constructed logits processors to the
-        logits_processors field. Returns the modified sampling params."""
+        """Constructs logits processors based on the logits_bias, and
+        allowed_token_ids fields in sampling_params. Deletes those fields and
+        adds the constructed logits processors to the logits_processors field.
+        Returns the modified sampling params."""
 
         logits_processors = []
-
-        if sampling_params.guided_decoding is not None:
-            # Defensively copy sampling params since guided decoding logits
-            # processors can have different state for each request
-            sampling_params = copy.copy(sampling_params)
-            guided_decoding = sampling_params.guided_decoding
-
-            logger.debug(
-                "Building guided decoding logits processor in "
-                "LLMEngine. Params: %s", guided_decoding)
-
-            tokenizer = self.get_tokenizer(lora_request=lora_request)
-            guided_decoding.backend = guided_decoding.backend or \
-                self.decoding_config.backend
-
-            if self.decoding_config.reasoning_backend:
-                logger.debug("Building with reasoning backend %s",
-                             self.decoding_config.reasoning_backend)
-
-            processor = get_local_guided_decoding_logits_processor(
-                guided_params=guided_decoding,
-                tokenizer=tokenizer,
-                model_config=self.model_config,
-                reasoning_backend=self.decoding_config.reasoning_backend,
-            )
-            if processor:
-                logits_processors.append(processor)
-
-            # Unset so this doesn't get passed down to the model
-            sampling_params.guided_decoding = None
 
         if (sampling_params.logit_bias or sampling_params.allowed_token_ids):
             tokenizer = self.get_tokenizer(lora_request=lora_request)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     LD_LIBRARY_PATH: Optional[str] = None
     VLLM_USE_TRITON_FLASH_ATTN: bool = True
     VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = False
+    VLLM_V1_R_KV_BUDGET: int = 64
+    VLLM_V1_R_KV_BUFFER: int = 64
     VLLM_FLASH_ATTN_VERSION: Optional[int] = None
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: Optional[str] = None
@@ -158,6 +161,18 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     return int(value)
+
+
+def _load_json_env(name: str) -> dict[str, Any]:
+    """Safely parse a JSON object from an environment variable."""
+    raw_value = os.getenv(name)
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def get_vllm_port() -> Optional[int]:
@@ -484,6 +499,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM", "0"))
                  ),
+    "VLLM_V1_R_KV_BUDGET":
+    lambda: int(os.getenv("VLLM_V1_R_KV_BUDGET", "64")),
+    "VLLM_V1_R_KV_BUFFER":
+    lambda: int(os.getenv("VLLM_V1_R_KV_BUFFER", "64")),
+    # Select compression method and optional JSON config for R-KV compressors.
+    "VLLM_RKV_METHOD":
+    lambda: os.getenv("VLLM_RKV_METHOD", "rkv"),
+    "VLLM_RKV_METHOD_CONFIG":
+    lambda: _load_json_env("VLLM_RKV_METHOD_CONFIG"),
 
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work

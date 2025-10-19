@@ -244,7 +244,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         block_table.append_token_ids(
             token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
             num_lookahead_slots=num_lookahead_slots,
-            num_computed_slots=seq.data.get_num_computed_tokens(),
+            num_computed_slots=seq.get_num_kv_cache_tokens(),
             extra_hash=seq.extra_hash(),
         )
         # Return any new copy-on-writes.

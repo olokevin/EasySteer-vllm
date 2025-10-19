@@ -1649,7 +1649,6 @@ class Scheduler:
                         seq_group.multi_modal_placeholders
                         if scheduler_outputs.num_prefill_groups > 0 else None),
                     prompt_adapter_request=seq_group.prompt_adapter_request,
-                    # 新增
                     steer_vector_request=seq_group.steer_vector_request,
                 )
             else:
@@ -1666,6 +1665,8 @@ class Scheduler:
                     do_sample=do_sample,
                     token_chunk_size=token_chunk_size,
                     computed_block_nums=common_computed_block_nums,
+                    prompt_adapter_request=seq_group.prompt_adapter_request,
+                    steer_vector_request=seq_group.steer_vector_request,
                 )
             seq_group_metadata_list.append(seq_group_metadata)
 

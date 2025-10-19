@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer."""
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -159,16 +160,21 @@ class Attention(nn.Module):
         self.layer_name = prefix
         self.attn_type = attn_type
 
+        disable_kv_sharing = os.getenv("EASYSTEER_ENABLE_KV_SHARING", "").lower() \
+            not in ("1", "true", "yes")
+
         if kv_sharing_target_layer_name is not None:
-            if not envs.VLLM_USE_V1:
+            if disable_kv_sharing:
+                kv_sharing_target_layer_name = None
+            elif not envs.VLLM_USE_V1:
                 raise NotImplementedError(
                     "Cross-layer KV sharing is not supported in V0.")
-
-            validate_kv_sharing_target(
-                prefix,
-                kv_sharing_target_layer_name,
-                compilation_config.static_forward_context,
-            )
+            else:
+                validate_kv_sharing_target(
+                    prefix,
+                    kv_sharing_target_layer_name,
+                    compilation_config.static_forward_context,
+                )
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         # use a placeholder kv cache tensor during init, which will be replaced
