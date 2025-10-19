@@ -203,6 +203,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.lora_index_mapping.clear()  # type: ignore
             self.lora_prompt_mapping.clear()  # type: ignore
             self.lora_requests.clear()  # type: ignore
+            if hasattr(self, "kv_compression_records"):
+                self.kv_compression_records = [None] * len(self.seq_ids)
 
         def __init__(
             self,
@@ -344,6 +346,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                     else:
                         self.lora_requests.clear()
 
+                    self.kv_compression_records = [None] * len(self.seq_ids)
+
             else:
                 self.input_tokens = input_tokens or []
                 self.inputs_embeds = inputs_embeds
@@ -387,6 +391,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
             self.lora_index_mapping = []
             self.lora_prompt_mapping = []
+            self.kv_compression_records = [None] * self.n_seqs
 
         def __repr__(self) -> str:
             return (f"InterDataForSeqGroup("
@@ -447,6 +452,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self._compute_for_prefix_cache_hit,
             self._compute_for_sliding_window,
             self._compute_lora_input,
+            self._collect_kv_compression,
         ]
         # Compute functions for each sequence group.
         # WARNING: The order of the functions matters!
@@ -657,6 +663,24 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             inter_data.lora_prompt_mapping.append([lora_id])
         else:
             inter_data.lora_prompt_mapping.append([])
+
+    def _collect_kv_compression(
+            self, inter_data: InterDataForSeqGroup, seq_idx: int,
+            seq_group_metadata: SequenceGroupMetadata) -> None:
+        compression_map = getattr(seq_group_metadata,
+                                   "kv_compression_records", None)
+        record = None
+        if compression_map is not None:
+            record = compression_map.get(inter_data.seq_ids[seq_idx])
+        if hasattr(inter_data, "kv_compression_records"):
+            inter_data.kv_compression_records[seq_idx] = record
+        builder = getattr(self, "attn_metadata_builder", None)
+        if builder is None:
+            return
+        if hasattr(builder, "append_kv_compression_record"):
+            builder.append_kv_compression_record(record)
+        elif hasattr(builder, "add_kv_compression_record"):
+            builder.add_kv_compression_record(record)
 
     def _compute_multi_modal_input(self, inter_data: InterDataForSeqGroup,
                                    seq_group_metadata: SequenceGroupMetadata):

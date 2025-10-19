@@ -4,7 +4,8 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
+from typing import (TYPE_CHECKING, Dict, List, Optional, Tuple, Type,
+                    Union)
 
 import torch
 
@@ -192,6 +193,13 @@ class FlashAttentionMetadata(AttentionMetadata):
     occupied_slot_mapping: Optional[torch.Tensor] = None
     total_num_kv_cache_tokens: int = 0
     num_dropped_tokens_list: Optional[list[int]] = None
+    remove_punct_ranges_list: Optional[
+        List[Optional[Union[Dict[Tuple[int, int], float],
+                            List[Tuple[int, int, float]]]]]] = None
+    completed_punct_ranges_list: Optional[
+        List[Optional[List[Tuple[int, int]]]]] = None
+    sentence_similarity_list: Optional[
+        List[Optional[Union[torch.Tensor, List[List[float]]]]]] = None
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -279,7 +287,16 @@ class FlashAttentionMetadata(AttentionMetadata):
             encoder_seq_start_loc=self.encoder_seq_start_loc,
             max_encoder_seq_len=self.max_encoder_seq_len,
             cross_slot_mapping=self.cross_slot_mapping,
-            cross_block_tables=self.cross_block_tables)
+            cross_block_tables=self.cross_block_tables,
+            remove_punct_ranges_list=(
+                self.remove_punct_records[:self.num_prefills]
+                if self.remove_punct_records else None),
+            completed_punct_ranges_list=(
+                self.completed_punct_records[:self.num_prefills]
+                if self.completed_punct_records else None),
+            sentence_similarity_list=(
+                self.sentence_similarity_records[:self.num_prefills]
+                if self.sentence_similarity_records else None))
         return self._cached_prefill_metadata
 
     @property
@@ -321,6 +338,18 @@ class FlashAttentionMetadata(AttentionMetadata):
                                      decode_context_tokens])
         num_dropped_tokens_list = ([0] * self.num_decode_tokens
                                    if self.num_decode_tokens > 0 else None)
+        remove_punct_ranges_list = None
+        completed_punct_ranges_list = None
+        sentence_similarity_list = None
+        if self.remove_punct_records:
+            remove_punct_ranges_list = self.remove_punct_records[
+                self.num_prefills:self.num_prefills + self.num_decode_tokens]
+        if self.completed_punct_records:
+            completed_punct_ranges_list = self.completed_punct_records[
+                self.num_prefills:self.num_prefills + self.num_decode_tokens]
+        if self.sentence_similarity_records:
+            sentence_similarity_list = self.sentence_similarity_records[
+                self.num_prefills:self.num_prefills + self.num_decode_tokens]
 
         self._cached_decode_metadata = FlashAttentionMetadata(
             num_prefills=0,
@@ -356,7 +385,10 @@ class FlashAttentionMetadata(AttentionMetadata):
             encoder_seq_start_loc=self.encoder_seq_start_loc,
             max_encoder_seq_len=self.max_encoder_seq_len,
             cross_slot_mapping=self.cross_slot_mapping,
-            cross_block_tables=self.cross_block_tables)
+            cross_block_tables=self.cross_block_tables,
+            remove_punct_ranges_list=remove_punct_ranges_list,
+            completed_punct_ranges_list=completed_punct_ranges_list,
+            sentence_similarity_list=sentence_similarity_list)
         return self._cached_decode_metadata
 
     def advance_step(self,
@@ -456,6 +488,30 @@ class FlashAttentionMetadataBuilder(
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
         self.has_prefix_cache_hit = False
+        self.remove_punct_records: List[Optional[Union[
+            Dict[Tuple[int, int], float], List[Tuple[int, int, float]]]]] = []
+        self.completed_punct_records: List[Optional[List[Tuple[int, int]]]] = []
+        self.sentence_similarity_records: List[Optional[Union[
+            torch.Tensor, List[List[float]]]]] = []
+
+    def append_kv_compression_record(self,
+                                     record: Optional[object]) -> None:
+        if record is None:
+            self.remove_punct_records.append(None)
+            self.completed_punct_records.append(None)
+            self.sentence_similarity_records.append(None)
+            return
+        if isinstance(record, dict):
+            remove = record.get("remove_punct_ranges")
+            completed = record.get("completed_punct_ranges")
+            similarity = record.get("sentence_similarity")
+        else:
+            remove = getattr(record, "remove_punct_ranges", None)
+            completed = getattr(record, "completed_punct_ranges", None)
+            similarity = getattr(record, "sentence_similarity", None)
+        self.remove_punct_records.append(remove)
+        self.completed_punct_records.append(completed)
+        self.sentence_similarity_records.append(similarity)
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -468,12 +524,15 @@ class FlashAttentionMetadataBuilder(
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
 
-        for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
-             curr_sliding_window_block) in zip(
-                 inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
-                 inter_data.orig_seq_lens, inter_data.seq_lens,
-                 inter_data.query_lens, inter_data.context_lens,
-                 inter_data.curr_sliding_window_blocks):
+        compression_records = getattr(inter_data, "kv_compression_records",
+                                      None)
+
+        for seq_offset, (seq_id, token_len, seq_len, curr_seq_len, query_len,
+                         context_len, curr_sliding_window_block) in enumerate(
+                inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
+                inter_data.orig_seq_lens, inter_data.seq_lens,
+                inter_data.query_lens, inter_data.context_lens,
+                inter_data.curr_sliding_window_blocks):
             self.context_lens.append(context_len)
             ctx_slot_mapping: List[int] = []
             compute_slot_mapping(
@@ -527,6 +586,10 @@ class FlashAttentionMetadataBuilder(
             compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
                                  seq_len, context_len, start_idx,
                                  self.block_size, inter_data.block_tables)
+            record = None
+            if compression_records is not None and \
+                    seq_offset < len(compression_records):
+                record = compression_records[seq_offset]
 
     def _get_graph_runner_block_tables(
             self, num_seqs: int,
@@ -1102,6 +1165,12 @@ class FlashAttentionImpl(AttentionImpl):
                     and decode_meta.context_lens is not None
                     and decode_meta.num_dropped_tokens_list is not None
                     and decode_meta.num_decode_tokens > 0):
+                remove_punct_ranges_list = getattr(
+                    decode_meta, "remove_punct_ranges_list", None)
+                completed_punct_ranges_list = getattr(
+                    decode_meta, "completed_punct_ranges_list", None)
+                sentence_similarity_list = getattr(
+                    decode_meta, "sentence_similarity_list", None)
                 context_lens_list = list(decode_meta.context_lens)
                 if len(context_lens_list) == decode_meta.num_decode_tokens:
                     occupied_slot_mapping = decode_meta.occupied_slot_mapping
@@ -1144,6 +1213,18 @@ class FlashAttentionImpl(AttentionImpl):
                         layer_idx = getattr(layer, "layer_idx",
                                             getattr(layer, "layer_id", 0))
                         current_pos = [int(context_len)]
+                        remove_punct_ranges = (
+                            None if remove_punct_ranges_list is None
+                            or i >= len(remove_punct_ranges_list)
+                            else remove_punct_ranges_list[i])
+                        completed_punct_ranges = (
+                            None if completed_punct_ranges_list is None
+                            or i >= len(completed_punct_ranges_list)
+                            else completed_punct_ranges_list[i])
+                        sentence_similarity = (
+                            None if sentence_similarity_list is None
+                            or i >= len(sentence_similarity_list)
+                            else sentence_similarity_list[i])
                         compressed_key_cache, compressed_value_cache = \
                             compressor.update_kv(
                                 current_key_cache,
@@ -1151,6 +1232,9 @@ class FlashAttentionImpl(AttentionImpl):
                                 current_value_cache,
                                 layer_idx=layer_idx,
                                 current_pos=current_pos,
+                                remove_punct_ranges=remove_punct_ranges,
+                                completed_punct_ranges=completed_punct_ranges,
+                                sentence_similarity=sentence_similarity,
                             )
                         compressed_key_cache = compressed_key_cache.squeeze(0)
                         compressed_value_cache = compressed_value_cache.squeeze(0)

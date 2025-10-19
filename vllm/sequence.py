@@ -786,6 +786,7 @@ class SequenceGroup:
         self.priority = priority
         self.prompt_adapter_request = prompt_adapter_request
         self.steer_vector_request = steer_vector_request
+        self.kv_compression_records: dict[int, dict[str, object]] = {}
 
         self.cached_request_output = None
 
@@ -1002,6 +1003,7 @@ class SequenceGroupMetadataDelta(
     steer_vector_request: Optional[SteerVectorRequest] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
+    kv_compression_records: Optional[dict[int, dict[str, object]]] = None
 
 
 class SequenceGroupMetadata(
@@ -1059,6 +1061,7 @@ class SequenceGroupMetadata(
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[list[int]] = None
     token_chunk_size: Optional[int] = None
+    kv_compression_records: Optional[dict[int, dict[str, object]]] = None
 
     ### Stateful fields that are lazily defined. ###
     # The number of speculative tokens adopted in this request.
@@ -1108,6 +1111,9 @@ class SequenceGroupMetadata(
         if sequence_group_metadata_delta.steer_vector_request is not None:
             self.steer_vector_request = (
                 sequence_group_metadata_delta.steer_vector_request)
+        if sequence_group_metadata_delta.kv_compression_records is not None:
+            self.kv_compression_records = (
+                sequence_group_metadata_delta.kv_compression_records)
 
     def finish_step(self) -> None:
         assert self.state is not None
