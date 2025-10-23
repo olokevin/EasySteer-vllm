@@ -953,7 +953,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # generations on machines < 100 for compressed-tensors
     # models
     "VLLM_USE_NVFP4_CT_EMULATIONS":
-    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0")))
+    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0"))),
+
+    # R1KV compression for v0 backend (FLASH_ATTN)
+    # Total KV cache size limit for v0 in tokens. Set to -1 to disable compression.
+    # When enabled, sequences exceeding BUDGET + BUFFER tokens will be compressed.
+    "VLLM_V0_R_KV_BUDGET":
+    lambda: int(os.getenv("VLLM_V0_R_KV_BUDGET", "-1")),
+
+    # Controls how many new tokens are generated before triggering KV compression in v0.
+    # Similar to VLLM_V1_R_KV_BUFFER but applies to vLLM v0 backend (FLASH_ATTN).
+    # Compression triggers when seq_len >= BUDGET + BUFFER.
+    "VLLM_V0_R_KV_BUFFER":
+    lambda: int(os.getenv("VLLM_V0_R_KV_BUFFER", "-1"))
 }
 
 # --8<-- [end:env-vars-definition]

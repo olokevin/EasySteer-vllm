@@ -4,6 +4,10 @@
 # vllm-flash-attn built from source
 vllm/vllm_flash_attn/*
 
+third_party/rkv_repo/
+R1KV_MIGRATION_PLAN.md/
+CLAUDE.md/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

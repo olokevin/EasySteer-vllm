@@ -22,6 +22,9 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
 
+# R1KV compression for v0 backend
+from rkv.compression import R1KV
+
 logger = init_logger(__name__)
 
 
@@ -130,6 +133,9 @@ class XFormersMetadata(AttentionMetadata, PagedAttentionMetadata):
     # the batch, used to index into subquery. E.g., if the subquery length
     # is [4, 6], it is [0, 4, 10].
     query_start_loc: Optional[torch.Tensor] = None
+
+    # R1KV: Number of tokens dropped per sequence in this batch due to compression
+    num_dropped_tokens_list: Optional[List[int]] = None
 
     # Self-attention prefill/decode metadata cache
     _cached_prefill_metadata: Optional["XFormersMetadata"] = None
@@ -351,6 +357,20 @@ class XFormersMetadataBuilder(CommonMetadataBuilder[XFormersMetadata]):
 
     _metadata_cls = XFormersMetadata
 
+    def build(self, seq_lens: List[int], query_lens: List[int],
+              cuda_graph_pad_size: int, batch_size: int):
+        """Build metadata with R1KV tracking initialization."""
+        # Call parent build
+        metadata = super().build(seq_lens, query_lens, cuda_graph_pad_size,
+                                batch_size)
+
+        # Initialize num_dropped_tokens_list for R1KV compression tracking
+        # One entry per sequence, initialized to 0
+        num_seqs = len(seq_lens)
+        metadata.num_dropped_tokens_list = [0] * num_seqs
+
+        return metadata
+
 
 class XFormersImpl(AttentionImpl[XFormersMetadata]):
     """
@@ -424,6 +444,15 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 f"Supported head sizes are: {supported_head_sizes}.")
 
         self.attn_type = attn_type
+
+        # Initialize R1KV compressor for v0 backend
+        from vllm.envs import VLLM_V0_R_KV_BUDGET, VLLM_V0_R_KV_BUFFER
+        if VLLM_V0_R_KV_BUDGET > 0 and VLLM_V0_R_KV_BUFFER > 0:
+            self.kvcompressor = R1KV(budget=VLLM_V0_R_KV_BUDGET)
+            logger.info(f"Initialized R1KV compressor with budget "
+                        f"{VLLM_V0_R_KV_BUDGET} for v0 XFORMERS backend.")
+        else:
+            self.kvcompressor = None
 
     def forward(
         self,
@@ -627,6 +656,83 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+            # R1KV compression for v0 backend (decode phase only)
+            if self.kvcompressor is not None and decode_meta is not None:
+                from vllm.envs import VLLM_V0_R_KV_BUDGET, VLLM_V0_R_KV_BUFFER
+                # Only compress in normal decoding
+                if decode_meta.max_decode_query_len is not None and decode_meta.max_decode_query_len <= 1:
+                    if decode_meta.seq_lens_tensor is not None:
+                        num_seqs = decode_meta.seq_lens_tensor.shape[0]
+                        block_size = key_cache.shape[1]  # XFormers: [num_blocks, block_size, num_heads, head_size]
+
+                        for seq_idx in range(num_seqs):
+                            seq_len = decode_meta.seq_lens_tensor[seq_idx].cpu().item()
+                            if seq_len < VLLM_V0_R_KV_BUDGET + VLLM_V0_R_KV_BUFFER:
+                                continue
+
+                            # Get block table for this sequence
+                            block_table = decode_meta.block_tables[seq_idx]
+                            num_blocks_needed = (seq_len + block_size - 1) // block_size
+                            block_indices = block_table[:num_blocks_needed]
+
+                            # Extract full KV cache for this sequence from paged blocks
+                            # XFormers format: [num_blocks, block_size, num_heads, head_size]
+                            current_key_blocks = key_cache[block_indices]  # [num_blocks, block_size, num_heads, head_size]
+                            current_value_blocks = value_cache[block_indices]
+
+                            # Reshape to [batch=1, num_heads, seq_len, head_size]
+                            current_key_flat = current_key_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
+                            current_value_flat = current_value_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
+                            current_key_cache = current_key_flat.transpose(0, 1).unsqueeze(0)
+                            current_value_cache = current_value_flat.transpose(0, 1).unsqueeze(0)
+
+                            # Extract query for this sequence
+                            current_query = decode_query[seq_idx:seq_idx+1]  # [1, num_heads, head_size]
+                            current_query = current_query.unsqueeze(2)  # [1, num_heads, 1, head_size]
+
+                            # Apply R1KV compression
+                            compressed_key, compressed_value = self.kvcompressor.update_kv(
+                                current_key_cache, current_query, current_value_cache
+                            )
+
+                            # Calculate compression statistics
+                            current_kv_len = current_key_cache.shape[2]
+                            compressed_kv_len = compressed_key.shape[2]
+                            num_dropped_tokens_i = current_kv_len - compressed_kv_len
+
+                            # Track dropped tokens in metadata
+                            if attn_metadata.num_dropped_tokens_list is not None:
+                                attn_metadata.num_dropped_tokens_list[seq_idx] = num_dropped_tokens_i
+
+                            # Write compressed KV back to cache
+                            # Reshape back to paged format
+                            compressed_key_flat = compressed_key.squeeze(0).transpose(0, 1)  # [compressed_len, num_heads, head_size]
+                            compressed_value_flat = compressed_value.squeeze(0).transpose(0, 1)
+
+                            # Calculate new number of blocks needed
+                            new_num_blocks = (compressed_kv_len + block_size - 1) // block_size
+
+                            # Write to blocks
+                            for block_idx in range(new_num_blocks):
+                                start_idx = block_idx * block_size
+                                end_idx = min(start_idx + block_size, compressed_kv_len)
+                                block_len = end_idx - start_idx
+
+                                physical_block_idx = block_indices[block_idx]
+                                key_cache[physical_block_idx, :block_len] = compressed_key_flat[start_idx:end_idx]
+                                value_cache[physical_block_idx, :block_len] = compressed_value_flat[start_idx:end_idx]
+
+                                # Zero out remaining slots in this block if not full
+                                if block_len < block_size:
+                                    key_cache[physical_block_idx, block_len:] = 0
+                                    value_cache[physical_block_idx, block_len:] = 0
+
+                            # Zero out blocks that are no longer needed
+                            for block_idx in range(new_num_blocks, num_blocks_needed):
+                                physical_block_idx = block_indices[block_idx]
+                                key_cache[physical_block_idx] = 0
+                                value_cache[physical_block_idx] = 0
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

@@ -31,6 +31,9 @@ from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 
+# R1KV compression support for v0 backend
+from rkv.compression import R1KV
+
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
@@ -153,6 +156,11 @@ class FlashAttentionMetadata(AttentionMetadata):
 
     # Max number of query tokens among request in the batch.
     max_decode_query_len: Optional[int] = None
+
+    # R1KV: Number of tokens dropped per sequence in this batch due to compression
+    # List of integers, one per sequence in the batch
+    # Used to update sequence lengths in scheduler for memory reclamation
+    num_dropped_tokens_list: Optional[List[int]] = None
 
     # (batch_size + 1,). The cumulative subquery lengths of the sequences in
     # the batch, used to index into subquery. E.g., if the subquery length
@@ -526,6 +534,9 @@ class FlashAttentionMetadataBuilder(
         seq_start_loc = list(accumulate(seq_lens, initial=0))
 
         num_seqs = len(seq_lens)
+        # Initialize num_dropped_tokens_list for R1KV compression tracking
+        # One entry per sequence, initialized to 0
+        num_dropped_tokens_list = [0] * num_seqs
         if use_captured_graph:
             self.slot_mapping.extend([PAD_SLOT_ID] * cuda_graph_pad_size)
             self.block_tables.extend([] * cuda_graph_pad_size)
@@ -577,6 +588,7 @@ class FlashAttentionMetadataBuilder(
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
+            num_dropped_tokens_list=num_dropped_tokens_list,
         )
 
 
@@ -662,6 +674,18 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
         self.attn_type = attn_type
+
+        # Initialize R1KV compressor for v0 backend
+        from vllm.envs import VLLM_V0_R_KV_BUDGET, VLLM_V0_R_KV_BUFFER
+        print(f"R1KV Compression Settings: {{'BUDGET': {VLLM_V0_R_KV_BUDGET}, 'BUFFER': {VLLM_V0_R_KV_BUFFER}}}")
+        if VLLM_V0_R_KV_BUDGET > 0 and VLLM_V0_R_KV_BUFFER > 0:
+            self.kvcompressor = R1KV(budget=VLLM_V0_R_KV_BUDGET)
+            logger.info(f"Initialized R1KV compressor with budget "
+                        f"{VLLM_V0_R_KV_BUDGET} for v0 FLASH_ATTN backend.")
+        else:
+            self.kvcompressor = None
+            logger.info("R1KV compressor is disabled for v0 FLASH_ATTN backend "
+                        "(BUDGET or BUFFER not set or <= 0).")
 
     def forward(
         self,
@@ -922,6 +946,95 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=layer._k_scale.expand(descale_shape),
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
+
+        # R1KV compression for v0 backend (decode phase only)
+        if self.kvcompressor is not None and decode_meta is not None:
+            from vllm.envs import VLLM_V0_R_KV_BUDGET, VLLM_V0_R_KV_BUFFER
+
+            # Only compress in normal decoding (not varlen decoding)
+            if decode_meta.max_decode_query_len is not None and decode_meta.max_decode_query_len <= 1:
+                # Get batch size from decode metadata
+                if decode_meta.seq_lens_tensor is not None:
+                    # Use .cpu().item() to safely extract scalar values
+                    # This works with CUDA graphs because seq_lens_tensor is created fresh each iteration
+                    num_seqs = decode_meta.seq_lens_tensor.shape[0]
+                    block_size = kv_cache.shape[2]  # [2, num_blocks, block_size, num_kv_heads, head_size]
+
+                    for seq_idx in range(num_seqs):
+                        # Use .cpu().item() to match v1 implementation for CUDA graph compatibility
+                        seq_len = decode_meta.seq_lens_tensor[seq_idx].cpu().item()
+
+                        # Only compress if sequence is long enough
+                        if seq_len < VLLM_V0_R_KV_BUDGET + VLLM_V0_R_KV_BUFFER:
+                            continue
+
+                        # Extract block table for this sequence
+                        if decode_meta.block_tables is not None:
+                            block_table = decode_meta.block_tables[seq_idx]
+                            # Get number of blocks actually used
+                            num_blocks_used = (seq_len + block_size - 1) // block_size
+                            block_table = block_table[:num_blocks_used]
+
+                            # 1. EXTRACT: Gather KV cache for this sequence from blocks
+                            # key_cache: [num_blocks, block_size, num_kv_heads, head_size]
+                            seq_key_blocks = key_cache[block_table]  # [num_blocks_used, block_size, num_kv_heads, head_size]
+                            seq_val_blocks = value_cache[block_table]
+
+                            # Reshape to continuous sequence
+                            # [num_blocks_used, block_size, num_kv_heads, head_size] -> [num_blocks_used * block_size, num_kv_heads, head_size]
+                            seq_key = seq_key_blocks.reshape(-1, seq_key_blocks.shape[-2], seq_key_blocks.shape[-1])[:seq_len]
+                            seq_val = seq_val_blocks.reshape(-1, seq_val_blocks.shape[-2], seq_val_blocks.shape[-1])[:seq_len]
+
+                            # 2. RESHAPE: Convert to R1KV format [1, num_kv_heads, seq_len, head_size]
+                            current_key = seq_key.permute(1, 0, 2).unsqueeze(0)  # [1, num_kv_heads, seq_len, head_size]
+                            current_val = seq_val.permute(1, 0, 2).unsqueeze(0)
+
+                            # Get current query (last token for this sequence)
+                            # decode_query shape: [num_decode_tokens, num_heads, head_size]
+                            # We need to find which position corresponds to seq_idx
+                            current_query = decode_query[seq_idx:seq_idx+1].unsqueeze(2)  # [1, num_heads, 1, head_size]
+
+                            # 3. COMPRESS: Apply R1KV compression
+                            compressed_key, compressed_val = self.kvcompressor.update_kv(
+                                current_key, current_query, current_val
+                            )
+
+                            # Get compressed sequence length
+                            compressed_len = compressed_key.shape[2]
+
+                            # 4. TRACK: Record dropped tokens for scheduler (like v1 does)
+                            num_dropped_tokens_i = seq_len - compressed_len
+                            if decode_meta.num_dropped_tokens_list is not None:
+                                # Update the count for this sequence
+                                # Only update if we actually dropped tokens and haven't already counted them
+                                if num_dropped_tokens_i != decode_meta.num_dropped_tokens_list[seq_idx]:
+                                    assert decode_meta.num_dropped_tokens_list[seq_idx] == 0, \
+                                        f"num_dropped_tokens_list[{seq_idx}] should be 0 before compression"
+                                    decode_meta.num_dropped_tokens_list[seq_idx] = num_dropped_tokens_i
+
+                            # 5. WRITE BACK: Store compressed cache back to blocks
+                            # compressed_key: [1, num_kv_heads, compressed_len, head_size]
+                            # Need to reshape back to block format
+                            compressed_key = compressed_key.squeeze(0).permute(1, 0, 2)  # [compressed_len, num_kv_heads, head_size]
+                            compressed_val = compressed_val.squeeze(0).permute(1, 0, 2)
+
+                            # Calculate how many blocks needed for compressed cache
+                            num_compressed_blocks = (compressed_len + block_size - 1) // block_size
+
+                            # Zero out the original blocks first
+                            key_cache[block_table] = 0
+                            value_cache[block_table] = 0
+
+                            # Write compressed cache back block by block
+                            for block_idx in range(num_compressed_blocks):
+                                start_token = block_idx * block_size
+                                end_token = min(start_token + block_size, compressed_len)
+                                num_tokens = end_token - start_token
+
+                                # Copy compressed tokens to block
+                                key_cache[block_table[block_idx], :num_tokens] = compressed_key[start_token:end_token]
+                                value_cache[block_table[block_idx], :num_tokens] = compressed_val[start_token:end_token]
+
         return output
 
 

@@ -1368,6 +1368,10 @@ class LLMEngine:
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
+
+                # R1KV: Update sequences with dropped tokens from compression
+                self._update_sequences_with_dropped_tokens(
+                    seq_group_metadata_list, scheduler_outputs)
             except InputProcessingError as e:
                 # The input for this request cannot be processed, so we must
                 # abort it. If there are remaining requests in the batch that
@@ -1572,6 +1576,57 @@ class LLMEngine:
                                     finished_before, skip)
             for logger in self.stat_loggers.values():
                 logger.log(stats)
+
+    def _update_sequences_with_dropped_tokens(
+            self,
+            seq_group_metadata_list: List[SequenceGroupMetadata],
+            scheduler_outputs: SchedulerOutputs) -> None:
+        """Update sequences with number of dropped tokens from R1KV compression.
+
+        This method extracts num_dropped_tokens_list from the attention metadata
+        and updates each sequence's num_dropped_tokens field. This is used by
+        the scheduler to properly track sequence lengths and free unused blocks.
+
+        Args:
+            seq_group_metadata_list: List of sequence group metadata from scheduler
+            scheduler_outputs: Scheduler outputs containing sequence groups
+        """
+        # Get the attention metadata which contains num_dropped_tokens_list
+        if not seq_group_metadata_list:
+            return
+
+        # Access the first metadata to get the attention metadata
+        # In v0, all sequences share the same attention metadata
+        first_metadata = seq_group_metadata_list[0]
+        if not hasattr(first_metadata, 'attn_metadata') or first_metadata.attn_metadata is None:
+            return
+
+        attn_metadata = first_metadata.attn_metadata
+
+        # Check if we have num_dropped_tokens_list (only present if R1KV compression is enabled)
+        if not hasattr(attn_metadata, 'num_dropped_tokens_list') or attn_metadata.num_dropped_tokens_list is None:
+            return
+
+        num_dropped_tokens_list = attn_metadata.num_dropped_tokens_list
+
+        # Update each sequence group's sequences
+        for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            if seq_group_idx >= len(num_dropped_tokens_list):
+                break
+
+            num_dropped = num_dropped_tokens_list[seq_group_idx]
+            if num_dropped > 0:
+                # Find matching sequence group in scheduler outputs
+                for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+                    if scheduled_seq_group.request_id == seq_group_metadata.request_id:
+                        # Update all sequences in this group
+                        for seq in scheduled_seq_group.seqs:
+                            # Accumulate dropped tokens (compression may happen multiple times)
+                            seq.num_dropped_tokens += num_dropped
+                            # Cap at total computed tokens to avoid overflow
+                            if seq.num_dropped_tokens > seq.get_len():
+                                seq.num_dropped_tokens = seq.get_len()
+                        break
 
     def _get_stats(self,
                    scheduler_outputs: Optional[SchedulerOutputs],

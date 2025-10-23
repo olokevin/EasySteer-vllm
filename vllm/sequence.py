@@ -506,9 +506,16 @@ class Sequence:
         # Input + output tokens
         self.tokens: Optional[list[str]] = None
 
+        # R1KV: Track number of tokens dropped due to KV cache compression
+        # Used by scheduler to update sequence lengths and free blocks
+        self.num_dropped_tokens: int = 0
+
     @property
     def n_blocks(self) -> int:
-        return (self.get_len() + self.block_size - 1) // self.block_size
+        # R1KV: Subtract dropped tokens from length to get actual blocks needed
+        # This allows the block manager to free unused blocks after compression
+        effective_len = max(0, self.get_len() - self.num_dropped_tokens)
+        return (effective_len + self.block_size - 1) // self.block_size
 
     @property
     def prompt(self) -> Optional[str]:
